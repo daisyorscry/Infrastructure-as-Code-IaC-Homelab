@@ -13,6 +13,8 @@
     ipv4_pattern: '{{ ipv4_octet }}(?:\.{{ ipv4_octet }}){3}'
     operator_public_key: "{{ lookup('ansible.builtin.env', 'VM_SSH_PUBLIC_KEY') | default(lookup('ansible.builtin.env', 'TF_VAR_ssh_public_key'), true) | trim }}"
     vm_key_directory: "{{ lookup('ansible.builtin.env', 'VM_SSH_KEY_DIR') | default('/var/lib/homelab/vm-keys', true) }}"
+    # Accept both survey extra vars and Secret environment delivery on runners.
+    guest_password: "{{ vm_password | default(lookup('ansible.builtin.env', 'vm_password'), true) | default(lookup('ansible.builtin.env', 'VM_GUEST_PASSWORD'), true) }}"
   module_defaults:
     group/community.proxmox.proxmox:
       api_host: "{{ pve_endpoint | urlsplit('hostname') }}"
@@ -65,11 +67,23 @@
           - node_name | length > 0 and datastore_id | length > 0 and bridge | length > 0
         fail_msg: "Check name, unused VMID >=100, CPU >=1, RAM >=1024, disk >=30, true/false on_boot, and DHCP/static IPv4 + gateway."
 
-    - name: Require the guest password from the Secret survey field
+    - name: Record only whether password input reached the runner
+      ansible.builtin.set_fact:
+        password_input_present:
+          extra_variable: "{{ vm_password | default('') | length > 0 }}"
+          survey_environment: "{{ lookup('ansible.builtin.env', 'vm_password') | length > 0 }}"
+          secret_environment: "{{ lookup('ansible.builtin.env', 'VM_GUEST_PASSWORD') | length > 0 }}"
+      no_log: true
+
+    - name: Show password delivery status without revealing its value
+      ansible.builtin.debug:
+        var: password_input_present
+
+    - name: Require the guest password from a Secret input
       ansible.builtin.assert:
         that:
-          - vm_password | default('') | length > 0
-        fail_msg: "Define the required Secret survey variable vm_password."
+          - guest_password | length > 0
+        fail_msg: "Password did not reach the runner. Use Secret survey vm_password with target Environment variable, or Secret environment VM_GUEST_PASSWORD in the attached Variable Group."
       no_log: true
 
     - name: Inspect the explicitly prepared persistent key directory
@@ -206,7 +220,7 @@
             net:
               net0: "virtio,bridge={{ bridge }}"
             ciuser: "{{ cloud_init_user }}"
-            cipassword: "{{ vm_password }}"
+            cipassword: "{{ guest_password }}"
             sshkeys: "{{ ([guest_ssh_key.public_key, operator_public_key] | reject('equalto', '') | list) | join('\n') }}"
             ipconfig:
               ipconfig0: "{{ 'ip=dhcp' if ipv4 == 'dhcp' else 'ip=' ~ ipv4 ~ ',gw=' ~ gateway }}"

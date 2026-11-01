@@ -63,7 +63,7 @@ Jika `VM_SSH_PUBLIC_KEY` kosong, public key tambahan lama dari `TF_VAR_ssh_publi
 
 ## Survey Variables
 
-Untuk semua field, **Pass variable as: Extra variable**, nama tanpa `TF_VAR_`.
+Untuk field biasa, **Pass variable as: Extra variable**, nama tanpa `TF_VAR_`. Khusus Secret `vm_password`, pilih **Environment variable** untuk melewati masalah pengiriman Secret extra variable pada setup runner ini. Nama tetap `vm_password`; playbook membaca environment tersebut.
 
 | Name | Title | Type | Default | Required |
 |---|---|---|---|---|
@@ -84,7 +84,11 @@ Default infrastructure ada di `ansible/vars/vm-factory.yml`: node `pve`, templat
 
 ## Password dan SSH
 
-Password diisi setiap Run melalui Secret survey dan diterapkan menggunakan Cloud-Init `cipassword` pada user `cloud_init_user`. Task password memakai `no_log: true` dan tidak menampilkan credential pada ringkasan. Secret masih diproses oleh Semaphore dan Proxmox/Cloud-Init, sehingga akses sistem tersebut tetap perlu dibatasi. Jangan memasukkan password ke default survey, command line, Git, atau log.
+Password diisi setiap Run melalui Secret survey `vm_password` dengan **Pass variable as: Environment variable** dan diterapkan menggunakan Cloud-Init `cipassword` pada user `cloud_init_user`. Task password memakai `no_log: true` dan tidak menampilkan credential pada ringkasan. Secret masih diproses oleh Semaphore dan Proxmox/Cloud-Init, sehingga akses sistem tersebut tetap perlu dibatasi. Jangan memasukkan password ke default survey, command line, Git, atau log.
+
+Jika field sudah diisi tetapi password tidak sampai ke runner, task menampilkan **boolean saja** pada `password_input_present`: `extra_variable`, `survey_environment`, dan `secret_environment`. Nilai/password maupun panjangnya tidak dicetak. `survey_environment: true` berarti Secret survey environment berhasil diterima. Extra variable lama tetap didukung untuk kompatibilitas.
+
+Alternatif untuk menguji jalur Secret yang sama dengan token Proxmox: tambahkan **Secret environment** `VM_GUEST_PASSWORD` pada Variable Group task ini. Isi melalui UI Semaphore, tanpa mengetiknya dalam command line/Git. Nonaktifkan requirement survey `vm_password` jika sengaja memakai alternatif Variable Group. Password group berlaku untuk run yang menggunakan group itu sampai diubah; untuk password berbeda per Run gunakan survey environment. Jika semua boolean tetap false, periksa Secret/group yang terpasang serta kecocokan versi server Semaphore dan remote runner; ini bukan error credential Proxmox.
 
 Password akun untuk console tidak menjamin SSH password login diizinkan. Kebijakan SSH/Cloud-Init di golden template harus disesuaikan jika ingin login SSH dengan password. Public key operator opsional bisa dipakai untuk SSH tanpa password.
 
