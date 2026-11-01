@@ -80,7 +80,7 @@ Untuk field biasa, **Pass variable as: Extra variable**, nama tanpa `TF_VAR_`. K
 
 Enum memakai Key `true` / label `Ya` dan Key `false` / label `Tidak`. Untuk DHCP, gateway kosong. Untuk statis, contoh `ipv4=192.168.10.116/24` dan `gateway=192.168.10.1`. Tags berupa `test,debian` dan tag `iac` ditambahkan otomatis.
 
-Default infrastructure ada di `ansible/vars/vm-factory.yml`: node `pve`, template `9201`, storage `nvme`, bridge `vmbr0`, user `debian`. Jika perlu override lewat form, tambahkan survey String `node_name`, Integer `template_id`, String `datastore_id`, String `bridge`, atau String `cloud_init_user`. Environment `TF_VAR_node_name` dan sejenisnya hanya untuk OpenTofu, tidak mengubah konfigurasi Ansible ini.
+Default infrastructure ada di `ansible/vars/vm-factory.yml`: node `pve`, template `9201`, storage `nvme`, bridge `vmbr1`, user `debian`. Jika perlu override lewat form, tambahkan survey String `node_name`, Integer `template_id`, String `datastore_id`, String `bridge`, atau String `cloud_init_user`. Environment `TF_VAR_node_name` dan sejenisnya hanya untuk OpenTofu, tidak mengubah konfigurasi Ansible ini.
 
 ## Password dan SSH
 

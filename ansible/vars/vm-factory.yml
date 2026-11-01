@@ -3,7 +3,7 @@
 node_name: pve
 template_id: 9201
 datastore_id: nvme
-bridge: vmbr0
+bridge: vmbr1
 cloud_init_user: debian
 cores: 4
 memory_mb: 8192
