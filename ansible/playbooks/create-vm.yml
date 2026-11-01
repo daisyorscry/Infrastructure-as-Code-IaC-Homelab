@@ -1,0 +1,215 @@
+---
+- name: Create one new Proxmox VM from the Semaphore form
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../vars/vm-factory.yml
+  vars:
+    # Reuse the existing Semaphore OpenTofu connection variables.
+    pve_endpoint: "{{ lookup('ansible.builtin.env', 'PROXMOX_VE_ENDPOINT') }}"
+    pve_token: "{{ lookup('ansible.builtin.env', 'PROXMOX_VE_API_TOKEN') }}"
+    ipv4_octet: '(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+    ipv4_pattern: '{{ ipv4_octet }}(?:\.{{ ipv4_octet }}){3}'
+    operator_public_key: "{{ lookup('ansible.builtin.env', 'VM_SSH_PUBLIC_KEY') | default(lookup('ansible.builtin.env', 'TF_VAR_ssh_public_key'), true) | trim }}"
+  module_defaults:
+    group/community.proxmox.proxmox:
+      api_host: "{{ pve_endpoint | urlsplit('hostname') }}"
+      api_port: "{{ (pve_endpoint | urlsplit('port')) | default(8006, true) | int }}"
+      api_user: "{{ pve_token.split('!', 1)[0] }}"
+      api_token_id: "{{ pve_token.split('!', 1)[1].split('=', 1)[0] }}"
+      api_token_secret: "{{ pve_token.split('=', 1)[1] }}"
+      validate_certs: "{{ not (lookup('ansible.builtin.env', 'PROXMOX_VE_INSECURE') | default('false', true) | bool) }}"
+      api_timeout: 30
+  tasks:
+    - name: Reject check mode because clone modules do not provide a real plan
+      ansible.builtin.assert:
+        that: not ansible_check_mode
+        fail_msg: "This is a create operation, not an OpenTofu Plan. Run normally after reviewing the form."
+
+    - name: Validate Proxmox connection and token format
+      ansible.builtin.assert:
+        that:
+          - pve_endpoint is match('^https://[^/]+/?$')
+          - pve_token is match('^[^!\s]+![^=\s]+=.+$')
+        fail_msg: "Set PROXMOX_VE_ENDPOINT and PROXMOX_VE_API_TOKEN=user@realm!token=secret."
+      no_log: true
+
+    - name: Validate the public VM form before making API calls
+      ansible.builtin.assert:
+        that:
+          - vm_name | default('') is match('^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$')
+          - vm_id | default('') | string is match('^[0-9]+$')
+          - vm_id | default(0) | int >= 100
+          - vm_id | default(0) | int <= 999999999
+          - vm_id | default(0) | int != template_id | int
+          - cores | string is match('^[0-9]+$') and cores | int >= 1
+          - memory_mb | string is match('^[0-9]+$') and memory_mb | int >= 1024
+          - disk_gb | string is match('^[0-9]+$') and disk_gb | int >= 30
+          - on_boot | string | lower in ['true', 'false']
+          - ipv4 == 'dhcp' or ipv4 is match('^' ~ ipv4_pattern ~ '/(?:[0-9]|[12][0-9]|3[0-2])$')
+          - (ipv4 == 'dhcp' and gateway | trim == '') or (ipv4 != 'dhcp' and gateway is match('^' ~ ipv4_pattern ~ '$'))
+          - vm_tags is string
+          - vm_tags.split(',') | map('trim') | reject('equalto', '') | reject('match', '^[a-zA-Z0-9_][a-zA-Z0-9_+.-]*$') | list | length == 0
+          - node_name | length > 0 and datastore_id | length > 0 and bridge | length > 0
+        fail_msg: "Check name, unused VMID >=100, CPU >=1, RAM >=1024, disk >=30, true/false on_boot, and DHCP/static IPv4 + gateway."
+
+    - name: Require the guest password from the Secret survey field
+      ansible.builtin.assert:
+        that:
+          - vm_password | default('') | length > 0
+        fail_msg: "Define the required Secret survey variable vm_password."
+      no_log: true
+
+    - name: Read the cluster-wide VM and container inventory
+      community.proxmox.proxmox_vm_info:
+      register: cluster_vms
+
+    - name: Reject existing IDs and duplicate names without modifying them
+      ansible.builtin.assert:
+        that:
+          - cluster_vms.proxmox_vms | selectattr('vmid', 'equalto', vm_id | int) | list | length == 0
+          - cluster_vms.proxmox_vms | selectattr('name', 'equalto', vm_name) | list | length == 0
+        fail_msg: "VMID or name already exists. Create VM never updates existing machines; inspect Proxmox before retrying a partial run."
+
+    - name: Inspect the source template configuration
+      community.proxmox.proxmox_vm_info:
+        vmid: "{{ template_id | int }}"
+        node: "{{ node_name }}"
+        type: qemu
+        config: current
+      register: source_template
+      no_log: true
+
+    - name: Require a cloud-init template with an scsi0 disk
+      ansible.builtin.assert:
+        that:
+          - source_template.proxmox_vms | length == 1
+          - source_template.proxmox_vms[0].template | bool
+          - source_template.proxmox_vms[0].config.scsi0 is defined
+          - source_template.proxmox_vms[0].config.net0 is defined
+          - "'cloudinit' in (source_template.proxmox_vms[0].config | to_json)"
+          - source_template.proxmox_vms[0].config.cicustom | default('') == ''
+        fail_msg: "Template must exist on the selected node, have scsi0 + Cloud-Init, and no custom Cloud-Init override."
+
+    - name: Read template disk size before cloning to prevent shrink requests
+      ansible.builtin.set_fact:
+        template_disk_sizes: "{{ source_template.proxmox_vms[0].config.scsi0 | regex_findall('(?:^|,)size=([0-9.]+)([KMGT])(?:,|$)') }}"
+
+    - name: Validate requested disk size against the actual template
+      ansible.builtin.assert:
+        that:
+          - template_disk_sizes | length == 1
+          - disk_gb | int >= (template_disk_sizes[0][0] | float * disk_unit_gib[template_disk_sizes[0][1]])
+        fail_msg: "Cannot parse template scsi0 size or requested disk is smaller than the source template."
+      vars:
+        disk_unit_gib: {K: 0.00000095367431640625, M: 0.0009765625, G: 1, T: 1024}
+
+    - name: Show the create request without credentials
+      ansible.builtin.debug:
+        msg:
+          name: "{{ vm_name }}"
+          vmid: "{{ vm_id | int }}"
+          node: "{{ node_name }}"
+          template: "{{ template_id | int }}"
+          cores: "{{ cores | int }}"
+          memory_mb: "{{ memory_mb | int }}"
+          disk_gb: "{{ disk_gb | int }}"
+          ipv4: "{{ ipv4 }}"
+
+    - name: Provision only the VM created by this run
+      block:
+        - name: Full clone the template into the unused VMID
+          community.proxmox.proxmox_kvm:
+            node: "{{ node_name }}"
+            vmid: "{{ template_id | int }}"
+            clone: source-template
+            newid: "{{ vm_id | int }}"
+            name: "{{ vm_name }}"
+            full: true
+            storage: "{{ datastore_id }}"
+            timeout: 600
+            state: present
+          register: clone_result
+
+        - name: Require successful creation by this run before allowing configuration
+          ansible.builtin.assert:
+            that:
+              - clone_result.changed | bool
+              - clone_result.vmid | int == vm_id | int
+            fail_msg: "Clone did not create the requested VM. Refusing configuration, including if another task took this VMID."
+
+        - name: Configure resources and Cloud-Init before the first boot
+          community.proxmox.proxmox_kvm:
+            node: "{{ node_name }}"
+            vmid: "{{ vm_id | int }}"
+            update: true
+            # Required for net0 updates; no disk mapping is passed to this task.
+            update_unsafe: true
+            cores: "{{ cores | int }}"
+            sockets: 1
+            cpu: host
+            memory: "{{ memory_mb | int }}"
+            balloon: 0
+            onboot: "{{ on_boot | bool }}"
+            agent: 'enabled=1'
+            net:
+              net0: "virtio,bridge={{ bridge }}"
+            ciuser: "{{ cloud_init_user }}"
+            cipassword: "{{ vm_password }}"
+            sshkeys: "{{ operator_public_key if operator_public_key | length > 0 else omit }}"
+            ipconfig:
+              ipconfig0: "{{ 'ip=dhcp' if ipv4 == 'dhcp' else 'ip=' ~ ipv4 ~ ',gw=' ~ gateway }}"
+            tags: "{{ (['iac'] + (vm_tags.split(',') | map('trim') | reject('equalto', '') | list)) | unique | list }}"
+            description: "Created by Semaphore Ansible VM Factory - {{ vm_name }}"
+            state: present
+          no_log: true
+
+        - name: Grow the cloned disk to the requested absolute size
+          community.proxmox.proxmox_disk:
+            vmid: "{{ vm_id | int }}"
+            disk: scsi0
+            size: "{{ disk_gb }}G"
+            state: resized
+
+        - name: Start the newly configured VM
+          community.proxmox.proxmox_kvm:
+            node: "{{ node_name }}"
+            vmid: "{{ vm_id | int }}"
+            state: started
+            timeout: 120
+      rescue:
+        - name: Report partial provisioning without deleting or changing existing VMs
+          ansible.builtin.fail:
+            msg: "Provisioning failed for VMID {{ vm_id }}. It may remain in Proxmox. Inspect its status/configuration before retrying; no automatic delete/reset is performed. Sensitive task details are hidden."
+
+    - name: Try to read addresses from the guest agent
+      community.proxmox.proxmox_vm_info:
+        node: "{{ node_name }}"
+        vmid: "{{ vm_id | int }}"
+        type: qemu
+        network: true
+      register: guest_info
+      until: >-
+        guest_info is succeeded and
+        (guest_info.proxmox_vms | default([]) | map(attribute='network', default=[]) | flatten
+        | map(attribute='ip-addresses', default=[]) | flatten
+        | selectattr('ip-address-type', 'equalto', 'ipv4')
+        | rejectattr('ip-address', 'match', '^(127\.|169\.254\.)') | list | length > 0)
+      retries: "{{ guest_agent_retries | int }}"
+      delay: "{{ guest_agent_delay | int }}"
+      ignore_errors: true
+
+    - name: Show VM result without credentials
+      ansible.builtin.debug:
+        msg:
+          vmid: "{{ vm_id | int }}"
+          name: "{{ vm_name }}"
+          guest_user: "{{ cloud_init_user }}"
+          ipv4: >-
+            {{ guest_info.proxmox_vms | default([]) | map(attribute='network', default=[]) | flatten
+            | map(attribute='ip-addresses', default=[]) | flatten
+            | selectattr('ip-address-type', 'equalto', 'ipv4')
+            | rejectattr('ip-address', 'match', '^(127\.|169\.254\.)')
+            | map(attribute='ip-address') | list }}
+          note: "VM started. Empty IP list means Guest Agent/DHCP is not ready; check the Proxmox console. Cloud-Init completion and SSH password login are not verified."

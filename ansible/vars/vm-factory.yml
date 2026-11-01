@@ -1,0 +1,17 @@
+---
+# Defaults for the Semaphore form. No secrets in this file.
+node_name: pve
+template_id: 9201
+datastore_id: nvme
+bridge: vmbr0
+cloud_init_user: debian
+cores: 4
+memory_mb: 8192
+disk_gb: 30
+ipv4: dhcp
+gateway: ''
+vm_tags: ''
+on_boot: true
+# Guest Agent is optional for reporting only; failure does not undo provisioning.
+guest_agent_retries: 12
+guest_agent_delay: 5
