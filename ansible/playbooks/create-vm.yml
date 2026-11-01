@@ -36,10 +36,20 @@
         fail_msg: "Set PROXMOX_VE_ENDPOINT and PROXMOX_VE_API_TOKEN=user@realm!token=secret."
       no_log: true
 
-    - name: Validate the public VM form before making API calls
+    - name: Validate the VM name received from the Semaphore survey
       ansible.builtin.assert:
         that:
           - vm_name | default('') is match('^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$')
+        fail_msg: >-
+          vm_name received: {{ vm_name | default('<missing>') | to_json }}.
+          In Semaphore set Survey Name=vm_name (not the Title), Type=String,
+          Pass variable as=Extra variable, Required=Yes.
+          Enter a hostname such as test-vm-factory, without spaces or underscores,
+          using 1-63 letters/digits/hyphens. Environment variables are not extra vars.
+
+    - name: Validate the public VM form before making API calls
+      ansible.builtin.assert:
+        that:
           - vm_id | default('') | string is match('^[0-9]+$')
           - vm_id | default(0) | int >= 100
           - vm_id | default(0) | int <= 999999999
