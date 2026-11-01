@@ -12,6 +12,7 @@
     ipv4_octet: '(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
     ipv4_pattern: '{{ ipv4_octet }}(?:\.{{ ipv4_octet }}){3}'
     operator_public_key: "{{ lookup('ansible.builtin.env', 'VM_SSH_PUBLIC_KEY') | default(lookup('ansible.builtin.env', 'TF_VAR_ssh_public_key'), true) | trim }}"
+    vm_key_directory: "{{ lookup('ansible.builtin.env', 'VM_SSH_KEY_DIR') | default('/var/lib/homelab/vm-keys', true) }}"
   module_defaults:
     group/community.proxmox.proxmox:
       api_host: "{{ pve_endpoint | urlsplit('hostname') }}"
@@ -61,6 +62,27 @@
         fail_msg: "Define the required Secret survey variable vm_password."
       no_log: true
 
+    - name: Inspect the explicitly prepared persistent key directory
+      ansible.builtin.stat:
+        path: "{{ vm_key_directory }}"
+        follow: false
+      register: key_directory
+
+    - name: Inspect the persistent key store setup marker
+      ansible.builtin.stat:
+        path: "{{ vm_key_directory }}/.persistent-key-store"
+        follow: false
+      register: key_store_marker
+
+    - name: Require a prepared private key store before creating a VM
+      ansible.builtin.assert:
+        that:
+          - vm_key_directory is match('^/')
+          - key_directory.stat.isdir | default(false)
+          - key_directory.stat.mode | default('') == '0700'
+          - key_store_marker.stat.isreg | default(false)
+        fail_msg: "Mount the persistent VM key directory into the runner, set mode 0700 and create .persistent-key-store. See docs/VM_FACTORY_ANSIBLE.md."
+
     - name: Read the cluster-wide VM and container inventory
       community.proxmox.proxmox_vm_info:
       register: cluster_vms
@@ -104,6 +126,24 @@
         fail_msg: "Cannot parse template scsi0 size or requested disk is smaller than the source template."
       vars:
         disk_unit_gib: {K: 0.00000095367431640625, M: 0.0009765625, G: 1, T: 1024}
+
+    - name: Generate and retain an ED25519 SSH key for this VMID
+      community.crypto.openssh_keypair:
+        path: "{{ vm_key_directory }}/vm-{{ vm_id | int }}"
+        type: ed25519
+        backend: opensshbin
+        comment: "{{ cloud_init_user }}@{{ vm_name }} vmid={{ vm_id | int }}"
+        mode: '0600'
+        regenerate: never
+        force: false
+      register: guest_ssh_key
+      no_log: true
+
+    - name: Require a readable generated ED25519 public key
+      ansible.builtin.assert:
+        that:
+          - guest_ssh_key.public_key is match('^ssh-ed25519 ')
+        fail_msg: "The saved key must be ED25519. Existing keys are never replaced automatically."
 
     - name: Show the create request without credentials
       ansible.builtin.debug:
@@ -157,7 +197,7 @@
               net0: "virtio,bridge={{ bridge }}"
             ciuser: "{{ cloud_init_user }}"
             cipassword: "{{ vm_password }}"
-            sshkeys: "{{ operator_public_key if operator_public_key | length > 0 else omit }}"
+            sshkeys: "{{ ([guest_ssh_key.public_key, operator_public_key] | reject('equalto', '') | list) | join('\n') }}"
             ipconfig:
               ipconfig0: "{{ 'ip=dhcp' if ipv4 == 'dhcp' else 'ip=' ~ ipv4 ~ ',gw=' ~ gateway }}"
             tags: "{{ (['iac'] + (vm_tags.split(',') | map('trim') | reject('equalto', '') | list)) | unique | list }}"
@@ -206,6 +246,8 @@
           vmid: "{{ vm_id | int }}"
           name: "{{ vm_name }}"
           guest_user: "{{ cloud_init_user }}"
+          private_key_path_on_runner: "{{ vm_key_directory }}/vm-{{ vm_id | int }}"
+          public_key_fingerprint: "{{ guest_ssh_key.fingerprint }}"
           ipv4: >-
             {{ guest_info.proxmox_vms | default([]) | map(attribute='network', default=[]) | flatten
             | map(attribute='ip-addresses', default=[]) | flatten
