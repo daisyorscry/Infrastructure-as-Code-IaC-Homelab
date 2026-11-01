@@ -18,6 +18,20 @@ Sebaiknya buat template baru agar task OpenTofu lama tetap tersimpan sebagai ars
 | Runner | Runner pada server ansible-opentofu |
 | SSH guest credential | Tidak diperlukan untuk create; playbook memakai API dari localhost runner |
 
+### Membuat inventory di UI
+
+Buat Inventory bernama `runner-local`. Jika tersedia opsi inventory dari repository, pilih repo ini dan path `ansible/inventory/runner.yml`. Alternatif yang tidak memerlukan path checkout adalah **Static inventory** dengan format YAML, lalu isi:
+
+```yaml
+all:
+  hosts:
+    localhost:
+      ansible_connection: local
+      ansible_python_interpreter: "{{ ansible_playbook_python }}"
+```
+
+Pilih inventory `runner-local` pada template Create VM. Tidak diperlukan SSH guest credential untuk eksekusi localhost ini; Deploy Key GitHub tetap dipakai pada konfigurasi Repository.
+
 Tidak perlu memilih workspace. Jangan mengaktifkan Ansible Check Mode/Dry Run: modul clone/resize tidak menyediakan Plan yang setara OpenTofu, dan playbook akan menolaknya. Review isian sebelum menjalankan task.
 
 Runner memerlukan Python >=3.11, Ansible Core >=2.17, dan binary `ssh-keygen` (paket OpenSSH client). Pasang dependency `ansible/requirements.txt` (`proxmoxer`, `requests`) pada Python yang dipakai Ansible di image runner. Requirements collection disediakan pada `ansible/collections/requirements.yml` dan `collections/requirements.yml`; pastikan Semaphore memasang collection atau sudah tersedia di image. File Python requirements tidak otomatis dipasang hanya karena berada di repository.
@@ -78,6 +92,32 @@ Password akun untuk console tidak menjamin SSH password login diizinkan. Kebijak
 
 Playbook membuat key **ED25519 per VMID** di key store runner. Private key tidak dicetak ke log, Git, atau state PostgreSQL. Ringkasan hanya menampilkan path dan fingerprint public key. Key tidak memiliki passphrase; batasi akses dan backup folder tersebut. Password guest tetap diisi lewat form dan tidak disimpan sebagai file oleh playbook.
 
+#### Cari Compose runner Semaphore
+
+Container `ansible` di `/opt/automation/ansible/docker-compose.yaml` berbeda dari container runner Semaphore. Mount penyimpanan key wajib dipasang pada runner **`semaphore-runner-runner-1`** yang menjalankan task.
+
+Jalankan di server `ansible-opentofu` untuk melihat lokasi Compose, direktori, project, dan service runner:
+
+```bash
+docker inspect semaphore-runner-runner-1 --format '{{ index .Config.Labels "com.docker.compose.project.config_files" }}'
+docker inspect semaphore-runner-runner-1 --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}'
+docker inspect semaphore-runner-runner-1 --format '{{ index .Config.Labels "com.docker.compose.project" }}'
+docker inspect semaphore-runner-runner-1 --format '{{ index .Config.Labels "com.docker.compose.service" }}'
+```
+
+Supaya tidak perlu menyalin path dari output terminal, simpan hasilnya sebagai variabel. Gunakan sesi terminal yang sama untuk langkah berikutnya:
+
+```bash
+runner_compose_file=$(docker inspect semaphore-runner-runner-1 --format '{{ index .Config.Labels "com.docker.compose.project.config_files" }}')
+runner_compose_dir=$(docker inspect semaphore-runner-runner-1 --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}')
+runner_project=$(docker inspect semaphore-runner-runner-1 --format '{{ index .Config.Labels "com.docker.compose.project" }}')
+runner_service=$(docker inspect semaphore-runner-runner-1 --format '{{ index .Config.Labels "com.docker.compose.service" }}')
+```
+
+Perintah edit/recreate di bawah untuk deployment dengan satu file Compose. Jika lokasi file berisi beberapa path dipisahkan koma, gunakan setiap file sebagai opsi `-f` terpisah sesuai urutannya. Jika metadata kosong atau `<no value>`, temukan konfigurasi deployment runner dahulu.
+
+#### Siapkan folder key
+
 **Setup sekali pada host Docker runner**, di luar repository:
 
 ```bash
@@ -88,6 +128,14 @@ sudo chmod 600 /opt/automation/vm-keys/.persistent-key-store
 
 Pastikan direktori dimiliki UID/GID user yang menjalankan proses Ansible di runner. Jika runner tidak menjalankan task sebagai root, sesuaikan ownership folder dan marker dengan `chown UID:GID` menggunakan UID/GID proses runner tersebut.
 
+#### Edit Compose runner
+
+Buka file yang ditemukan tadi (untuk deployment satu file Compose):
+
+```bash
+nano "$runner_compose_file"
+```
+
 Tambahkan bind mount berikut pada **service runner dalam Compose runner yang sudah ada**, gabungkan dengan volume lain tanpa menghapusnya:
 
 ```yaml
@@ -97,12 +145,43 @@ services:
       - /opt/automation/vm-keys:/var/lib/homelab/vm-keys
 ```
 
-Sesuaikan nama service jika berbeda. Recreate service runner menggunakan file/project Compose runner yang sama; jangan membuat project runner baru. Sebelum Run, pastikan folder host dan marker terlihat di dalam runner:
+#### Terapkan perubahan runner
+
+Sesuaikan nama service pada YAML jika bukan `runner`, lalu simpan file. Jalankan saat tidak ada task Semaphore yang aktif karena runner dapat dibuat ulang:
+
+```bash
+cd "$runner_compose_dir"
+docker compose -p "$runner_project" -f "$runner_compose_file" config --quiet && docker compose -p "$runner_project" -f "$runner_compose_file" up -d "$runner_service"
+```
+
+Perintah ini memakai project/file/service runner yang sama. Jangan jalankan pada Compose container `ansible` yang terpisah.
+
+#### Cek mount dan permission
+
+Sebelum Run, pastikan folder host dan marker terlihat di dalam runner:
 
 ```bash
 docker exec semaphore-runner-runner-1 ls -ld /var/lib/homelab/vm-keys
 docker exec semaphore-runner-runner-1 ls -l /var/lib/homelab/vm-keys/.persistent-key-store
 ```
+
+Lihat mount dan UID/GID proses runner:
+
+```bash
+docker inspect semaphore-runner-runner-1 --format '{{ range .Mounts }}{{ println .Source "->" .Destination }}{{ end }}'
+docker top semaphore-runner-runner-1 -eo pid,uid,gid,args
+```
+
+Pastikan ada `/opt/automation/vm-keys -> /var/lib/homelab/vm-keys`. Jika proses yang menjalankan Ansible bukan root, ganti `UID_RUNNER:GID_RUNNER` berikut dengan angka UID/GID proses tersebut:
+
+```bash
+sudo chown UID_RUNNER:GID_RUNNER /opt/automation/vm-keys
+sudo chown UID_RUNNER:GID_RUNNER /opt/automation/vm-keys/.persistent-key-store
+sudo chmod 700 /opt/automation/vm-keys
+sudo chmod 600 /opt/automation/vm-keys/.persistent-key-store
+```
+
+Jika ingin menjalankan playbook manual dari container `ansible` terpisah, mount yang sama juga bisa ditambahkan pada service itu. Untuk task Semaphore, mount runner tetap wajib.
 
 Playbook memeriksa direktori mode `0700` dan marker sebelum melakukan provisioning. Marker merupakan penanda bahwa admin sudah menyiapkan mount; playbook tidak dapat menjamin durabilitas storage hanya dari adanya marker. Jangan membuat direktori/marker hanya di filesystem sementara container. User runner perlu dapat menulis ke folder itu.
 
