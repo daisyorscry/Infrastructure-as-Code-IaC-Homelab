@@ -11,7 +11,7 @@ Playbook init dan worker terpisah. Hapus parameter lama `cluster_operation` dan 
 
 ## Membuat cluster
 
-Spawn VM melalui [VM Factory](../docs/VM_FACTORY_ANSIBLE.md), lalu isi `inventory/cilium.yml` atau `inventory/istio.yml`: tepat satu control plane dan setidaknya sebanyak `worker_count` worker. Setiap host punya `ansible_host` dan `vm_id`; inventory memakai key persisten factory. Gunakan VM dan pool LB berbeda untuk kedua cluster.
+Spawn VM melalui [VM Factory](../README.md#quick-start), lalu isi `inventory/cilium.yml` atau `inventory/istio.yml`: tepat satu control plane dan setidaknya sebanyak `worker_count` worker. Setiap host punya `ansible_host` dan `vm_id`; inventory memakai key persisten factory. Gunakan VM dan pool LB berbeda untuk kedua cluster.
 
 `worker_count` default/minimum `4`. Playbook memilih sejumlah itu dari grup `k8s_workers` berdasarkan urutan nama. `gateway_hostname` boleh kosong agar Gateway menerima semua hostname. Tidak ada mode operasi atau parameter master/worker join pada form init.
 
@@ -62,4 +62,4 @@ ANSIBLE_CONFIG=ansible/ansible.cfg ansible-playbook -i ansible/inventory/cilium.
 python -m unittest discover -s tests -v
 ```
 
-Tes memakai Ansible Core, PyYAML, dan Jinja2 pada environment Linux yang sama. Lihat [panduan Semaphore](../docs/SEMAPHORE.md) untuk konfigurasi form.
+Tes memakai Ansible Core, PyYAML, dan Jinja2 pada environment Linux yang sama. Lihat [tabel playbook dan parameter Semaphore](../README.md#playbooks) untuk konfigurasi form.
