@@ -1,13 +1,12 @@
 ---
-cluster_operation: init
+cluster_flow: "{{ hostvars['localhost'].selected_flow }}"
 # Init selects this many inventoried workers; the initial minimum remains four.
 worker_count: 4
-# Semaphore String survey: comma-separated inventory names, or a YAML/JSON list.
+# Worker playbook only: choose a master inventory name and worker inventory names.
+master: ''
 workers: ''
-# Backward compatibility for callers using the original join-only list.
-join_workers: []
 cluster_stack: "{{ hostvars['localhost'].selected_stack }}"
-cluster_control_plane: "{{ groups['k8s_control_plane'][0] }}"
+cluster_control_plane: "{{ hostvars['localhost'].selected_master }}"
 cluster_worker_targets: "{{ hostvars['localhost'].selected_workers }}"
 cluster_node_targets: "{{ [cluster_control_plane] + cluster_worker_targets }}"
 cluster_api_ip: "{{ hostvars[cluster_control_plane].ansible_host }}"
@@ -22,6 +21,7 @@ cluster_record:
   stack: "{{ cluster_stack }}"
   pod_cidr: "{{ pod_cidr }}"
   service_cidr: "{{ service_cidr }}"
+  node_lan_cidr: "{{ node_lan_cidr }}"
   api_ip: "{{ cluster_api_ip }}"
   kubernetes_version: "{{ kubernetes_version }}"
   crio_version: "{{ crio_version }}"

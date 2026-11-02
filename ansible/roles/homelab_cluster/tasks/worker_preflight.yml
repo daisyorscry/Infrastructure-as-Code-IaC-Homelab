@@ -1,0 +1,60 @@
+---
+- name: Require independent worker parameters and a complete run
+  ansible.builtin.assert:
+    that:
+      - not ansible_check_mode
+      - ansible_limit | default('') | length == 0
+      - cluster_flow == 'worker'
+      - cluster_operation is not defined
+      - join_workers is not defined
+      - master is string and master | length > 0
+      - master in groups.get('k8s_control_plane', [])
+      - workers is string or (workers is sequence and workers is not mapping)
+      - workers | length > 0
+    fail_msg: >-
+      Use add-workers.yml with master=<control-plane inventory name> and
+      workers=<comma-separated worker inventory names>. No cluster_operation or join_workers.
+      Run without --limit or check mode.
+
+- name: Normalize the selected master and worker names
+  ansible.builtin.set_fact:
+    selected_master: "{{ master }}"
+    selected_workers: "{{ workers.split(',') | map('trim') | list if workers is string else workers }}"
+
+- name: Validate exactly the worker targets requested
+  ansible.builtin.assert:
+    that:
+      - selected_workers | length > 0
+      - selected_workers | difference(groups.get('k8s_workers', [])) | length == 0
+      - selected_workers | unique | length == selected_workers | length
+      - selected_master not in selected_workers
+    fail_msg: Select known, unique workers; empty entries and selecting a master as a worker are rejected.
+
+- name: Validate selected inventory hostnames and addresses
+  ansible.builtin.assert:
+    that:
+      - item is match('^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')
+      - hostvars[item].ansible_host is defined
+  loop: "{{ cluster_node_targets }}"
+
+- name: Register the selected master only
+  ansible.builtin.add_host:
+    name: "{{ selected_master }}"
+    groups: cluster_master
+
+- name: Register only selected machines for guest access
+  ansible.builtin.add_host:
+    name: "{{ item }}"
+    groups: cluster_selected_nodes
+  loop: "{{ cluster_node_targets }}"
+
+- name: Show the independent worker request before guest access
+  ansible.builtin.debug:
+    msg:
+      master: "{{ selected_master }}"
+      workers: "{{ selected_workers }}"
+      configuration_source: /etc/kubernetes/homelab/profile.json on selected master
+
+- name: Mark successful controller-side validation
+  ansible.builtin.set_fact:
+    cluster_preflight_passed: true

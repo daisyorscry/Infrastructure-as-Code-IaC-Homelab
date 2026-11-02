@@ -1,6 +1,6 @@
 ---
 - name: Install network stack only during init or init retry
-  when: cluster_operation == 'init'
+  when: cluster_flow == 'init'
   block:
     - name: Create Helm download cache
       ansible.builtin.file:
@@ -36,6 +36,9 @@
 
     - name: Install the selected CNI and gateway controller
       ansible.builtin.include_tasks: "network-{{ cluster_stack }}.yml"
+
+    - name: Configure L2 announcements on the actual worker interfaces
+      ansible.builtin.include_tasks: configure_worker_l2.yml
 
     - name: Apply Gateway namespace and HTTP listener
       ansible.builtin.command:

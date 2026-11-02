@@ -11,12 +11,37 @@
       - (ansible_facts.distribution == 'Debian' and ansible_facts.distribution_major_version | int >= 12) or (ansible_facts.distribution == 'Ubuntu' and ansible_facts.distribution_version is version('24.04', '>='))
     fail_msg: Use Debian >=12 or Ubuntu >=24.04 with kernel >=6.1, amd64/arm64, working SSH, and sudo.
 
-- name: Require stable node IP and selected L2 interfaces
+- name: Require the stable node IP to belong to the guest
   ansible.builtin.assert:
     that:
       - ansible_host in ansible_facts.all_ipv4_addresses
-      - inventory_hostname == cluster_control_plane or (l2_interfaces | difference(ansible_facts.interfaces)) | length == 0
-    fail_msg: The inventory IP must belong to this VM and every L2 interface must exist on each selected worker.
+    fail_msg: The inventory IP must belong to this VM.
+
+- name: Detect the worker route toward the control plane
+  ansible.builtin.command:
+    argv: [ip, -j, -4, route, get, "{{ cluster_api_ip }}"]
+  register: worker_lan_route
+  changed_when: false
+  when: inventory_hostname != cluster_control_plane and l2_interfaces | length == 0
+
+- name: Select per-worker L2 interfaces without assuming NIC names
+  ansible.builtin.set_fact:
+    node_l2_interfaces: "{{ [(worker_lan_route.stdout | from_json)[0].dev] if l2_interfaces | length == 0 else l2_interfaces }}"
+  when: inventory_hostname != cluster_control_plane
+
+- name: Verify the selected worker interface exists and is not loopback
+  ansible.builtin.assert:
+    that:
+      - node_l2_interfaces | length > 0
+      - node_l2_interfaces | difference(ansible_facts.interfaces) | length == 0
+      - "'lo' not in node_l2_interfaces"
+    fail_msg: No usable interface toward the master; inspect guest routing or explicitly set l2_interfaces at init.
+  when: inventory_hostname != cluster_control_plane
+
+- name: Show the actual worker L2 interfaces
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} L2 interfaces: {{ node_l2_interfaces }}"
+  when: inventory_hostname != cluster_control_plane
 
 - name: Inspect node identity and Kubernetes state
   ansible.builtin.slurp:

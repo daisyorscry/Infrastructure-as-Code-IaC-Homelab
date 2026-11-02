@@ -1,0 +1,68 @@
+---
+- name: Validate independent worker request
+  hosts: localhost
+  connection: local
+  tags: [preflight]
+  gather_facts: false
+  any_errors_fatal: true
+  pre_tasks:
+    - name: Select the dedicated worker flow
+      ansible.builtin.set_fact:
+        selected_flow: worker
+  tasks:
+    - name: Validate master and worker parameters
+      ansible.builtin.import_role:
+        name: "{{ playbook_dir }}/../roles/homelab_cluster"
+        tasks_from: worker_preflight
+
+- name: Read cluster configuration from the selected master
+  hosts: cluster_master
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Validate existing cluster and load its profile
+      ansible.builtin.import_role:
+        name: "{{ playbook_dir }}/../roles/homelab_cluster"
+        tasks_from: inspect_control_plane
+
+- name: Inspect only the selected nodes
+  hosts: cluster_selected_nodes
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Inspect membership and identity
+      ansible.builtin.import_role:
+        name: "{{ playbook_dir }}/../roles/homelab_cluster"
+        tasks_from: inspect_nodes
+
+- name: Prepare new workers using the master profile
+  hosts: cluster_new_nodes
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Install the matching CRI-O and Kubernetes packages
+      ansible.builtin.import_role:
+        name: "{{ playbook_dir }}/../roles/homelab_cluster"
+        tasks_from: bootstrap
+
+- name: Join new workers and verify readiness
+  hosts: cluster_master
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Join the selected workers
+      ansible.builtin.import_role:
+        name: "{{ playbook_dir }}/../roles/homelab_cluster"
+        tasks_from: join
+    - name: Register L2 announcements for the new worker interfaces
+      ansible.builtin.import_role:
+        name: "{{ playbook_dir }}/../roles/homelab_cluster"
+        tasks_from: configure_worker_l2
+    - name: Verify the selected workers
+      ansible.builtin.import_role:
+        name: "{{ playbook_dir }}/../roles/homelab_cluster"
+        tasks_from: verify_workers

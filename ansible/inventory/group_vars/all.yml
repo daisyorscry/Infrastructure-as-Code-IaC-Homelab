@@ -13,12 +13,13 @@ gateway_api_version: 'v1.6.3'
 
 pod_cidr: 10.244.0.0/16
 service_cidr: 10.96.0.0/12
-# Fill in your LAN and a reserved LB range OUTSIDE DHCP and all other clusters.
-node_lan_cidr: CHANGE_ME
-lb_start_ip: CHANGE_ME
-lb_stop_ip: CHANGE_ME
-# Actual NIC names, not regexes. Must exist on every selected worker.
-l2_interfaces: [ens18]
+# LAN nodes use DHCP; reserve this Gateway/LB range outside the router DHCP pool.
+# If both clusters run concurrently, give each a separate LB range via Extra vars.
+node_lan_cidr: 192.168.10.0/24
+lb_start_ip: 192.168.10.10
+lb_stop_ip: 192.168.10.20
+# Empty auto-detects each worker's interface toward the master. Set names to override.
+l2_interfaces: []
 gateway_namespace: gateway-system
 gateway_name: homelab-gateway
 # Empty accepts any hostname; set a domain if desired. Initial listener is HTTP :80.

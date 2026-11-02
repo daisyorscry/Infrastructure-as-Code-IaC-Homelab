@@ -1,0 +1,10 @@
+---
+- name: Apply per-worker L2 announcements using detected interfaces
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", apply, -f, -]
+    stdin: "{{ lookup('ansible.builtin.template', role_path ~ '/templates/worker-l2.yml.j2') }}"
+  register: worker_l2_apply
+  retries: 12
+  delay: 5
+  until: worker_l2_apply.rc == 0
+  changed_when: "'created' in worker_l2_apply.stdout or 'configured' in worker_l2_apply.stdout"

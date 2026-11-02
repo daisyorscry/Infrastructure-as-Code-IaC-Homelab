@@ -19,7 +19,7 @@
     that:
       - cp_files.results[0].stat.exists == cp_files.results[1].stat.exists
       - cp_files.results[0].stat.exists or (not cp_files.results[2].stat.exists and not cp_files.results[3].stat.exists)
-      - cluster_operation != 'join' or cp_files.results[0].stat.exists
+      - cluster_flow != 'worker' or cp_files.results[0].stat.exists
     fail_msg: >-
       Join requires an initialized cluster from this playbook. Existing cluster without profile,
       or partial kubeadm init, needs inspection. No automatic reset or adoption is performed.
@@ -43,6 +43,11 @@
         fail_msg: >-
           Cluster profile differs. Use a separate inventory/VMs for each stack.
           These entry points initialize or add workers; upgrades and network migrations need a separate procedure.
+      when: cluster_flow == 'init'
+
+    - name: Load worker configuration from the master profile
+      ansible.builtin.include_tasks: load_worker_profile.yml
+      when: cluster_flow == 'worker'
 
     - name: Require a healthy API and the pinned Kubernetes version
       ansible.builtin.command:
@@ -67,7 +72,7 @@
           - "cluster_stack != 'istio' or ('calico-node' in ds_names and 'cilium' not in ds_names and 'kube-proxy' in ds_names)"
       vars:
         ds_names: "{{ (live_daemonsets.stdout | from_json)['items'] | map(attribute='metadata.name') | list }}"
-      when: cluster_operation == 'join'
+      when: cluster_flow == 'worker'
 
 - name: Read cluster CA fingerprint for membership checks
   ansible.builtin.stat:

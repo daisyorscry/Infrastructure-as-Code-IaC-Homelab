@@ -1,6 +1,6 @@
 ---
 - name: Initialize only in init mode
-  when: cluster_operation == 'init'
+  when: cluster_flow == 'init'
   block:
     - name: Create private cluster configuration directory
       ansible.builtin.file:

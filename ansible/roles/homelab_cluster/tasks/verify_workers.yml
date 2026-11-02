@@ -1,0 +1,29 @@
+---
+- name: Wait for each selected worker to register
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", get, node, "{{ item }}", -o, name]
+  loop: "{{ cluster_worker_targets }}"
+  register: worker_registered
+  changed_when: false
+  retries: 30
+  delay: 5
+  until: worker_registered.rc == 0
+
+- name: Wait for each selected worker to become Ready
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", wait, --for=condition=Ready, "node/{{ item }}", --timeout=600s]
+  loop: "{{ cluster_worker_targets }}"
+  changed_when: false
+
+- name: Read selected worker status
+  ansible.builtin.command:
+    argv: "{{ ['kubectl', '--kubeconfig', cluster_kubeconfig, 'get', 'nodes'] + cluster_worker_targets + ['-o', 'wide'] }}"
+  register: joined_workers
+  changed_when: false
+
+- name: Show worker result
+  ansible.builtin.debug:
+    msg:
+      master: "{{ cluster_control_plane }}"
+      stack: "{{ cluster_stack }}"
+      workers: "{{ joined_workers.stdout_lines }}"

@@ -1,21 +1,22 @@
 ---
-- name: Require a full inventory run and explicit operation
+- name: Require an init-only request with a complete inventory
   ansible.builtin.assert:
     that:
       - not ansible_check_mode
       - ansible_limit | default('') | length == 0
-      - cluster_operation in ['init', 'join']
+      - cluster_flow == 'init'
+      - cluster_operation is not defined
+      - join_workers is not defined
+      - master | length == 0
+      - workers | length == 0
       - groups.get('k8s_control_plane', []) | length == 1
       - groups.get('k8s_workers', []) | length > 0
       - (groups.get('k8s_control_plane', []) | intersect(groups.get('k8s_workers', []))) | length == 0
-      - workers is string or (workers is sequence and workers is not mapping)
-      - join_workers is sequence and join_workers is not string and join_workers is not mapping
-      - workers | length == 0 or join_workers | length == 0
-      - cluster_operation != 'init' or join_workers | length == 0
     fail_msg: >-
+      This playbook creates a cluster. Set worker_count and optional gateway_hostname.
       Run without --limit/check mode and use one control plane.
-      Set workers as comma-separated inventory names or a YAML/JSON list.
-      Do not combine workers with the legacy join_workers parameter.
+      For adding workers use add-workers.yml with master and workers.
+      Remove cluster_operation, join_workers, master, and workers from the init form.
 
 - name: Validate the requested initial worker count
   ansible.builtin.assert:
@@ -24,32 +25,15 @@
       - worker_count | int >= 4
       - worker_count | int <= groups['k8s_workers'] | length
     fail_msg: worker_count must be an integer >=4 workers and cannot exceed workers available in inventory.
-  when: cluster_operation == 'init'
-
-- name: Normalize worker input from the Semaphore form
-  ansible.builtin.set_fact:
-    requested_workers: "{{ (workers.split(',') | map('trim') | list) if workers is string and workers | trim | length > 0 else (workers if workers is not string else join_workers) }}"
-
-- name: Validate explicit worker selection before resolving hosts
-  ansible.builtin.assert:
-    that:
-      - requested_workers | difference(groups['k8s_workers']) | length == 0
-      - requested_workers | unique | length == requested_workers | length
-      - cluster_operation != 'join' or requested_workers | length > 0
-      - cluster_operation != 'init' or requested_workers | length == 0 or requested_workers | length == worker_count | int
-    fail_msg: >-
-      Use known, unique worker inventory names without empty entries.
-      Init requires exactly worker_count names when workers is filled.
-      Join requires at least one worker in workers.
 
 - name: Resolve exact hosts for this operation
   ansible.builtin.set_fact:
-    selected_workers: "{{ requested_workers if requested_workers | length > 0 else (groups['k8s_workers'] | sort)[:worker_count | int] }}"
+    selected_master: "{{ groups['k8s_control_plane'][0] }}"
+    selected_workers: "{{ (groups['k8s_workers'] | sort)[:worker_count | int] }}"
 
 - name: Show the selected workers before guest access
   ansible.builtin.debug:
     msg:
-      operation: "{{ cluster_operation }}"
       worker_count: "{{ selected_workers | length }}"
       workers: "{{ selected_workers }}"
 
@@ -66,7 +50,7 @@
       - cluster_stack != 'istio' or calico_version is match('^v[0-9]+\.[0-9]+\.[0-9]+$')
       - cluster_stack != 'istio' or istio_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
       - cluster_stack != 'istio' or metallb_version is match('^v[0-9]+\.[0-9]+\.[0-9]+$')
-      - l2_interfaces is sequence and l2_interfaces is not string and l2_interfaces | length > 0
+      - l2_interfaces is sequence and l2_interfaces is not string and l2_interfaces is not mapping
       - l2_interfaces | reject('match', '^[a-zA-Z0-9_.:-]+$') | list | length == 0
       - gateway_namespace is match('^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')
       - gateway_name is match('^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')

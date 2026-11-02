@@ -51,7 +51,6 @@
   ansible.builtin.debug:
     msg:
       stack: "{{ cluster_stack }}"
-      operation: "{{ cluster_operation }}"
       selected_workers: "{{ cluster_worker_targets }}"
       gateway_addresses: "{{ (gateway_status.stdout | from_json).status.addresses }}"
       nodes: "{{ cluster_nodes.stdout_lines }}"

@@ -1,0 +1,51 @@
+---
+- name: Decode the profile stored on the selected master
+  ansible.builtin.set_fact:
+    worker_cluster_profile: "{{ recorded_profile.content | b64decode | from_json }}"
+
+- name: Require a supported initialized cluster profile
+  ansible.builtin.assert:
+    that:
+      - worker_cluster_profile.stack in ['cilium', 'istio']
+      - worker_cluster_profile.api_ip == ansible_host
+      - worker_cluster_profile.kubernetes_version is match('^1\.(35|36)\.[0-9]+$')
+      - worker_cluster_profile.crio_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+      - worker_cluster_profile.kubernetes_version.split('.')[0:2] == worker_cluster_profile.crio_version.split('.')[0:2]
+      - worker_cluster_profile.l2_interfaces is sequence and worker_cluster_profile.l2_interfaces is not string
+      - worker_cluster_profile.l2_interfaces is not mapping
+    fail_msg: Master profile is missing, incompatible, or belongs to another API address. No worker changes made.
+
+- name: Detect CNI stack from the master instead of the init form
+  ansible.builtin.set_fact:
+    selected_stack: "{{ worker_cluster_profile.stack }}"
+  delegate_to: localhost
+  delegate_facts: true
+
+- name: Supply master-derived runtime settings to each selected node
+  ansible.builtin.set_fact:
+    cluster_name: "{{ worker_cluster_profile.name }}"
+    kubernetes_version: "{{ worker_cluster_profile.kubernetes_version }}"
+    crio_version: "{{ worker_cluster_profile.crio_version }}"
+    l2_interfaces: "{{ worker_cluster_profile.l2_interfaces }}"
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: "{{ cluster_node_targets }}"
+
+- name: Validate selected node addresses against the master Pod and Service networks
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -c
+      - |
+        import ipaddress, json, sys
+        c = json.loads(sys.argv[1])
+        pod, svc = (ipaddress.IPv4Network(c[k]) for k in ('pod', 'service'))
+        start, stop = (ipaddress.IPv4Address(c[k]) for k in ('start', 'stop'))
+        ips = [ipaddress.IPv4Address(v) for v in c['hosts']]
+        assert len(ips) == len(set(ips)), 'Duplicate selected node addresses'
+        assert all(ip not in pod and ip not in svc and not int(start) <= int(ip) <= int(stop) for ip in ips), 'Selected node address overlaps Pod/Service/LB network'
+        assert not c['lan'] or all(ip in ipaddress.IPv4Network(c['lan']) for ip in ips), 'Selected node outside cluster LAN'
+      - "{{ {'pod': worker_cluster_profile.pod_cidr, 'service': worker_cluster_profile.service_cidr, 'lan': worker_cluster_profile.node_lan_cidr | default(''), 'start': worker_cluster_profile.lb_start_ip, 'stop': worker_cluster_profile.lb_stop_ip, 'hosts': cluster_node_targets | map('extract', hostvars, 'ansible_host') | list} | to_json }}"
+  delegate_to: localhost
+  become: false
+  changed_when: false

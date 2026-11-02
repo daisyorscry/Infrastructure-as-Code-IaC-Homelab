@@ -1,5 +1,6 @@
 """Local Ansible validation. No task in these tests connects to a VM."""
 import json
+import base64
 import os
 from pathlib import Path
 import shutil
@@ -29,6 +30,9 @@ class ClusterTests(unittest.TestCase):
         }
 
     def run_preflight(self, stack='cilium', expected=True, message='', **overrides):
+        if stack == 'workers':
+            overrides.setdefault('master', 'master-1')
+        playbook = 'add-workers.yml' if stack == 'workers' else f'cluster-{stack}.yml'
         with tempfile.TemporaryDirectory() as tmp:
             inv = Path(tmp) / 'inventory.yml'
             inv.write_text(yaml.safe_dump(self.inventory))
@@ -36,8 +40,8 @@ class ClusterTests(unittest.TestCase):
                        ANSIBLE_INVENTORY_ENABLED='yaml,ini', ANSIBLE_NOCOLOR='1')
             result = subprocess.run([
                 str(Path(sys.executable).with_name('ansible-playbook')) if Path(sys.executable).with_name('ansible-playbook').is_file() else shutil.which('ansible-playbook'), '-i', str(inv),
-                str(ANSIBLE / f'playbooks/cluster-{stack}.yml'), '--tags', 'preflight',
-                '-e', json.dumps(dict(self.config, **overrides)),
+                str(ANSIBLE / 'playbooks' / playbook), '--tags', 'preflight',
+                '-e', json.dumps(dict({} if stack == 'workers' else self.config, **overrides)),
             ], cwd=ANSIBLE, env=env, capture_output=True, text=True, timeout=60)
             output = result.stdout + result.stderr
             self.assertEqual(result.returncode == 0, expected, output)
@@ -59,7 +63,7 @@ class ClusterTests(unittest.TestCase):
         self.run_preflight(expected=False, message='>=4 workers')
 
     def test_join_selects_only_requested_worker(self):
-        output = self.run_preflight(cluster_operation='join', workers='worker-4')
+        output = self.run_preflight(stack='workers', workers='worker-4')
         section = output.split('Register only selected machines for guest access')[1]
         self.assertIn('item=master-1', section)
         self.assertIn('item=worker-4', section)
@@ -67,12 +71,12 @@ class ClusterTests(unittest.TestCase):
 
     def test_join_does_not_require_four_new_workers(self):
         self.inventory['all']['children']['k8s_workers']['hosts'] = {'worker-5': {'ansible_host': '192.168.10.25'}}
-        self.run_preflight(cluster_operation='join', join_workers=['worker-5'])
+        self.run_preflight(stack='workers', workers='worker-5')
 
     def test_join_requires_known_targets(self):
         for targets in ([], ['missing-worker'], 'missing-worker', 'worker-4,', 'worker-4,worker-4'):
             with self.subTest(targets=targets):
-                self.run_preflight(expected=False, cluster_operation='join', workers=targets)
+                self.run_preflight(stack='workers', expected=False, workers=targets)
 
     def test_init_worker_count_from_string_survey(self):
         self.workers['worker-5'] = {'ansible_host': '192.168.10.25'}
@@ -82,12 +86,9 @@ class ClusterTests(unittest.TestCase):
                 section = output.split('Register only selected machines for guest access')[1]
                 self.assertEqual('item=worker-5' in section, count == '5')
 
-    def test_init_can_select_specific_workers(self):
-        self.workers['worker-5'] = {'ansible_host': '192.168.10.25'}
-        output = self.run_preflight(workers='worker-5, worker-4,worker-3,worker-2', worker_count=4)
-        section = output.split('Register only selected machines for guest access')[1]
-        self.assertIn('item=worker-5', section)
-        self.assertNotIn('item=worker-1', section)
+    def test_init_rejects_worker_form_parameters(self):
+        self.run_preflight(expected=False, workers='worker-1,worker-2,worker-3,worker-4')
+        self.run_preflight(expected=False, master='master-1')
 
     def test_init_rejects_invalid_worker_counts(self):
         for count in (3, 5, 'all', 4.5, True):
@@ -97,18 +98,30 @@ class ClusterTests(unittest.TestCase):
     def test_init_rejects_selection_count_mismatch(self):
         self.run_preflight(expected=False, workers='worker-1,worker-2', worker_count=4)
 
-    def test_join_accepts_list_and_csv_on_both_stacks(self):
-        for stack in ('cilium', 'istio'):
-            for workers in (['worker-3', 'worker-4'], 'worker-3, worker-4'):
-                with self.subTest(stack=stack, workers=workers):
-                    output = self.run_preflight(stack=stack, cluster_operation='join', workers=workers)
-                    section = output.split('Register only selected machines for guest access')[1]
-                    self.assertIn('item=worker-3', section)
-                    self.assertIn('item=worker-4', section)
-                    self.assertNotIn('item=worker-1', section)
+    def test_join_accepts_list_and_csv_without_init_config(self):
+        for workers in (['worker-3', 'worker-4'], 'worker-3, worker-4'):
+            with self.subTest(workers=workers):
+                output = self.run_preflight(stack='workers', workers=workers)
+                section = output.split('Register only selected machines for guest access')[1]
+                self.assertIn('item=worker-3', section)
+                self.assertIn('item=worker-4', section)
+                self.assertNotIn('item=worker-1', section)
 
-    def test_rejects_ambiguous_old_and_new_worker_parameters(self):
-        self.run_preflight(expected=False, cluster_operation='join', workers='worker-4', join_workers=['worker-3'])
+    def test_rejects_obsolete_operation_parameter(self):
+        self.run_preflight(expected=False, cluster_operation='join')
+        self.run_preflight(stack='workers', expected=False, workers='worker-4', cluster_operation='init')
+
+    def test_worker_flow_requires_explicit_known_master(self):
+        for master in ('', 'unknown-master', 'worker-1'):
+            with self.subTest(master=master):
+                self.run_preflight(stack='workers', expected=False, master=master, workers='worker-4')
+
+    def test_worker_flow_selects_master_independently(self):
+        self.inventory['all']['children']['k8s_control_plane']['hosts']['master-2'] = {'ansible_host': '192.168.10.12'}
+        output = self.run_preflight(stack='workers', master='master-2', workers='worker-4')
+        section = output.split('Register only selected machines for guest access')[1]
+        self.assertIn('item=master-2', section)
+        self.assertNotIn('item=master-1', section)
 
     def test_rejects_second_control_plane(self):
         self.inventory['all']['children']['k8s_control_plane']['hosts']['master-2'] = {'ansible_host': '192.168.10.12'}
@@ -137,7 +150,11 @@ class ClusterTests(unittest.TestCase):
         env.filters.update(FilterModule().filters())
         context = yaml.safe_load((ANSIBLE / 'inventory/group_vars/all.yml').read_text())
         context.update(self.config, cluster_api_ip='192.168.10.11', inventory_hostname='master-1',
-                       cluster_cri_socket='unix:///var/run/crio/crio.sock')
+                       cluster_cri_socket='unix:///var/run/crio/crio.sock',
+                       cluster_worker_targets=['worker-1', 'worker-2', 'worker-3'],
+                       hostvars={'worker-1': {'node_l2_interfaces': ['ens18']},
+                                 'worker-2': {'node_l2_interfaces': ['ens19']},
+                                 'worker-3': {'node_l2_interfaces': ['eth0']}})
         for stack in ('cilium', 'istio'):
             context['cluster_stack'] = stack
             for template in (ROLE / 'templates').glob('*.j2'):
@@ -152,10 +169,55 @@ class ClusterTests(unittest.TestCase):
                     if template.name == 'cilium-values.yml.j2':
                         self.assertTrue(docs[0]['kubeProxyReplacement'])
                         self.assertEqual(docs[0]['ipam']['operator']['clusterPoolIPv4PodCIDRList'], [context['pod_cidr']])
+                    if template.name == 'worker-l2.yml.j2':
+                        self.assertEqual(len(docs), 3)
+                        for doc, worker, nic in zip(docs, context['cluster_worker_targets'], ['ens18', 'ens19', 'eth0']):
+                            spec = doc['spec']
+                            selector = spec['nodeSelector'] if stack == 'cilium' else spec['nodeSelectors'][0]
+                            self.assertEqual(selector['matchLabels']['kubernetes.io/hostname'], worker)
+                            self.assertEqual(spec['interfaces'], [f'^{nic}$' if stack == 'cilium' else nic])
 
-    def test_two_cluster_entrypoints_and_factory_are_the_only_playbooks(self):
+    def test_workers_load_runtime_and_interface_mode_from_master(self):
+        for stack in ('cilium', 'istio'):
+            with self.subTest(stack=stack), tempfile.TemporaryDirectory() as tmp:
+                profile = {
+                    'name': f'existing-{stack}', 'stack': stack, 'api_ip': '192.168.10.11',
+                    'kubernetes_version': '1.36.1', 'crio_version': '1.36.2', 'l2_interfaces': [],
+                    'pod_cidr': '10.244.0.0/16', 'service_cidr': '10.96.0.0/12',
+                    'node_lan_cidr': '192.168.10.0/24', 'lb_start_ip': '192.168.10.200',
+                    'lb_stop_ip': '192.168.10.220',
+                }
+                inv = Path(tmp) / 'inventory.yml'
+                inv.write_text(yaml.safe_dump(self.inventory))
+                play = Path(tmp) / 'load-profile.yml'
+                play.write_text(yaml.safe_dump([{
+                    'hosts': 'localhost', 'gather_facts': False, 'connection': 'local',
+                    'tasks': [{'ansible.builtin.set_fact': {
+                        'selected_flow': 'worker', 'selected_master': 'master-1',
+                        'selected_workers': ['worker-4'],
+                    }}],
+                }, {
+                    'hosts': 'master-1', 'connection': 'local', 'gather_facts': False,
+                    'vars': {'recorded_profile': {'content': base64.b64encode(json.dumps(profile).encode()).decode()}},
+                    'tasks': [
+                        {'ansible.builtin.import_role': {'name': str(ROLE), 'tasks_from': 'load_worker_profile'}},
+                        {'ansible.builtin.assert': {'that': [
+                            "hostvars['worker-4'].kubernetes_version == '1.36.1'",
+                            "hostvars['worker-4'].crio_version == '1.36.2'",
+                            "hostvars['worker-4'].l2_interfaces == []",
+                            f"hostvars['localhost'].selected_stack == '{stack}'",
+                        ]}},
+                    ],
+                }]))
+                result = subprocess.run([
+                    str(Path(sys.executable).with_name('ansible-playbook')), '-i', str(inv), str(play),
+                ], cwd=ANSIBLE, env=dict(os.environ, ANSIBLE_CONFIG=str(ANSIBLE / 'ansible.cfg'),
+                                        ANSIBLE_NOCOLOR='1'), capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_separate_init_worker_and_factory_entrypoints(self):
         self.assertEqual({p.name for p in (ANSIBLE / 'playbooks').glob('*.yml')},
-                         {'create-vm.yml', 'cluster-cilium.yml', 'cluster-istio.yml'})
+                         {'create-vm.yml', 'cluster-cilium.yml', 'cluster-istio.yml', 'add-workers.yml'})
 
 
 if __name__ == '__main__':
