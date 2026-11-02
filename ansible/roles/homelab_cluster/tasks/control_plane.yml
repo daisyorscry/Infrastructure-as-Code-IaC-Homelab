@@ -1,0 +1,39 @@
+---
+- name: Initialize only in init mode
+  when: cluster_operation == 'init'
+  block:
+    - name: Create private cluster configuration directory
+      ansible.builtin.file:
+        path: "{{ cluster_config_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Render kubeadm configuration for CRI-O and this stack
+      ansible.builtin.template:
+        src: kubeadm-init.yml.j2
+        dest: "{{ cluster_config_dir }}/kubeadm-init.yml"
+        mode: '0600'
+      when: not cluster_initialized
+
+    - name: Initialize control plane with the selected proxy mode
+      ansible.builtin.command:
+        argv: "{{ ['kubeadm', 'init', '--config', cluster_config_dir ~ '/kubeadm-init.yml'] + (['--skip-phases=addon/kube-proxy'] if cluster_stack == 'cilium' else []) }}"
+        creates: "{{ cluster_kubeconfig }}"
+      when: not cluster_initialized
+      # kubeadm init prints a bootstrap token; do not expose it in Semaphore logs.
+      no_log: true
+
+    - name: Record the immutable cluster profile after initialization
+      ansible.builtin.copy:
+        dest: "{{ cluster_profile_path }}"
+        content: "{{ cluster_record | to_nice_json }}\n"
+        mode: '0600'
+
+- name: Wait for the Kubernetes API
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", get, --raw=/readyz]
+  register: api_ready
+  changed_when: false
+  retries: 30
+  delay: 5
+  until: api_ready.rc == 0

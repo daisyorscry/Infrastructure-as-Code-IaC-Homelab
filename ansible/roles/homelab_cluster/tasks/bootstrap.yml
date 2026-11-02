@@ -1,0 +1,159 @@
+---
+- name: Require a clean CNI configuration on new guests
+  ansible.builtin.find:
+    paths: /etc/cni/net.d
+    patterns: ['*.conf', '*.conflist']
+  register: old_cni_configs
+
+- name: Refuse to overwrite an existing CNI
+  ansible.builtin.assert:
+    that: old_cni_configs.matched == 0
+    fail_msg: New node has an active CNI configuration; inspect the template before continuing.
+
+- name: Wait for Cloud-Init to finish before package changes
+  ansible.builtin.command:
+    argv: [cloud-init, status, --wait]
+  changed_when: false
+
+- name: Set Kubernetes hostname before initial registration
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+
+- name: Set hostname resolution
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^127\.0\.1\.1\s+'
+    line: "127.0.1.1 {{ inventory_hostname }}"
+
+- name: Install runtime prerequisites
+  ansible.builtin.apt:
+    name: [ca-certificates, curl, gnupg, iptables, conntrack, socat, python3-apt]
+    update_cache: true
+    state: present
+    lock_timeout: 300
+
+- name: Persist kernel modules for Kubernetes and Envoy TPROXY
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/homelab-kubernetes.conf
+    mode: '0644'
+    content: |
+      overlay
+      br_netfilter
+      nf_conntrack
+      xt_socket
+      xt_TPROXY
+      iptable_mangle
+      iptable_raw
+
+- name: Load kernel modules now
+  ansible.builtin.command:
+    argv: [modprobe, "{{ item }}"]
+  loop: [overlay, br_netfilter, nf_conntrack, xt_socket, xt_TPROXY, iptable_mangle, iptable_raw]
+  changed_when: false
+
+- name: Persist required forwarding settings
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-homelab-kubernetes.conf
+    mode: '0644'
+    content: |
+      net.bridge.bridge-nf-call-iptables = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward = 1
+
+- name: Apply sysctls before kubeadm
+  ansible.builtin.command:
+    argv: [sysctl, --system]
+  changed_when: false
+
+- name: Disable active swap
+  ansible.builtin.command:
+    argv: [swapoff, -a]
+  when: ansible_facts.swaptotal_mb | int > 0
+  changed_when: true
+
+- name: Disable fstab swap on reboot
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^(?!#)(\S+\s+\S+\s+swap\s+.*)$'
+    replace: '# \1'
+
+- name: Create keyring and CRI-O directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop: [/etc/apt/keyrings, /etc/crio/crio.conf.d, /etc/cni/net.d, /opt/cni/bin]
+
+- name: Download package repository signing keys
+  ansible.builtin.get_url:
+    url: "{{ item.url }}"
+    dest: "/etc/apt/keyrings/{{ item.name }}.asc"
+    mode: '0644'
+  loop:
+    - name: kubernetes
+      url: "https://pkgs.k8s.io/core:/stable:/{{ cluster_kubernetes_minor }}/deb/Release.key"
+    - name: cri-o
+      url: "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/{{ cluster_kubernetes_minor }}/deb/Release.key"
+
+- name: Configure Kubernetes and CRI-O repositories
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/{{ item.name }}.asc] {{ item.url }} /"
+    filename: "{{ item.name }}"
+    state: present
+    update_cache: true
+  loop:
+    - name: kubernetes
+      url: "https://pkgs.k8s.io/core:/stable:/{{ cluster_kubernetes_minor }}/deb/"
+    - name: cri-o
+      url: "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/{{ cluster_kubernetes_minor }}/deb/"
+
+- name: Install pinned runtime and Kubernetes packages
+  ansible.builtin.apt:
+    name:
+      - "cri-o={{ crio_version }}-*"
+      - "kubelet={{ kubernetes_version }}-*"
+      - "kubeadm={{ kubernetes_version }}-*"
+      - "kubectl={{ kubernetes_version }}-*"
+    state: present
+    lock_timeout: 300
+
+- name: Hold runtime and Kubernetes packages
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop: [cri-o, kubelet, kubeadm, kubectl]
+
+- name: Configure systemd cgroups and standard CNI directories for CRI-O
+  ansible.builtin.copy:
+    dest: /etc/crio/crio.conf.d/99-homelab.conf
+    mode: '0644'
+    content: |
+      [crio.runtime]
+      cgroup_manager = "systemd"
+      [crio.network]
+      network_dir = "/etc/cni/net.d"
+      plugin_dirs = ["/opt/cni/bin", "/usr/lib/cni"]
+  register: crio_config
+
+- name: Enable and start CRI-O
+  ansible.builtin.systemd_service:
+    name: crio
+    daemon_reload: true
+    enabled: true
+    state: "{{ 'restarted' if crio_config.changed else 'started' }}"
+
+- name: Enable kubelet for kubeadm
+  ansible.builtin.systemd_service:
+    name: kubelet
+    enabled: true
+
+- name: Pin kubelet node IP to the inventory address
+  ansible.builtin.copy:
+    dest: /etc/default/kubelet
+    mode: '0644'
+    content: "KUBELET_EXTRA_ARGS=--node-ip={{ ansible_host }}\n"
+
+- name: Wait for the CRI-O socket
+  ansible.builtin.wait_for:
+    path: /var/run/crio/crio.sock
+    timeout: 60

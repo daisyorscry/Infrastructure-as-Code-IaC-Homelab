@@ -25,14 +25,13 @@ echo "Directory  : $PWD"
 
 section "Checking Dependencies"
 
-for app in bash ansible ansible-playbook tofu git python3; do
+for app in bash ansible ansible-playbook git python3 ssh-keygen; do
     require_command "$app"
 done
 
 section "Checking Versions"
 
 ansible-playbook --version | head -n 1
-tofu version | head -n 2
 git --version
 python3 --version
 
@@ -44,15 +43,10 @@ ANSIBLE_HOST_KEY_CHECKING=True ansible \
     --connection local \
     -m ansible.builtin.ping
 
-section "Testing OpenTofu"
-
-tofu version >/dev/null
-echo "[OK] OpenTofu executable successfully"
-
 section "Final Result"
 
 echo "[PASS] Semaphore Runner is working."
 echo "[PASS] Ansible local connection successful."
-echo "[PASS] OpenTofu is available."
+echo "[PASS] OpenSSH key generator is available."
 echo "[PASS] Git is available."
 echo "No infrastructure resources were modified."

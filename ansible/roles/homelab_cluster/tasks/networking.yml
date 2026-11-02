@@ -1,0 +1,45 @@
+---
+- name: Install network stack only during init or init retry
+  when: cluster_operation == 'init'
+  block:
+    - name: Create Helm download cache
+      ansible.builtin.file:
+        path: "{{ cluster_config_dir }}/downloads"
+        state: directory
+        mode: '0700'
+
+    - name: Download pinned Helm archive and verify published checksum
+      ansible.builtin.get_url:
+        url: "https://get.helm.sh/helm-v{{ helm_version }}-linux-{{ cluster_helm_arch }}.tar.gz"
+        checksum: "sha256:https://get.helm.sh/helm-v{{ helm_version }}-linux-{{ cluster_helm_arch }}.tar.gz.sha256sum"
+        dest: "{{ cluster_config_dir }}/downloads/helm.tar.gz"
+        mode: '0600'
+
+    - name: Extract Helm into the private download cache
+      ansible.builtin.unarchive:
+        src: "{{ cluster_config_dir }}/downloads/helm.tar.gz"
+        dest: "{{ cluster_config_dir }}/downloads"
+        remote_src: true
+
+    - name: Install Helm binary
+      ansible.builtin.copy:
+        src: "{{ cluster_config_dir }}/downloads/linux-{{ cluster_helm_arch }}/helm"
+        dest: /usr/local/bin/helm
+        mode: '0755'
+        remote_src: true
+
+    - name: Install pinned standard Gateway API CRDs
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", apply, --server-side, -f, "https://github.com/kubernetes-sigs/gateway-api/releases/download/{{ gateway_api_version }}/standard-install.yaml"]
+      register: gateway_crds
+      changed_when: "'created' in gateway_crds.stdout or 'configured' in gateway_crds.stdout"
+
+    - name: Install the selected CNI and gateway controller
+      ansible.builtin.include_tasks: "network-{{ cluster_stack }}.yml"
+
+    - name: Apply Gateway namespace and HTTP listener
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", apply, -f, -]
+        stdin: "{{ lookup('ansible.builtin.template', role_path ~ '/templates/gateway.yml.j2') }}"
+      register: gateway_apply
+      changed_when: "'created' in gateway_apply.stdout or 'configured' in gateway_apply.stdout"

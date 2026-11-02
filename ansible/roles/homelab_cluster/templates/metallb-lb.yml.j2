@@ -1,0 +1,25 @@
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: {{ cluster_name }}-lan
+  namespace: metallb-system
+spec:
+  addresses:
+    - {{ (lb_start_ip ~ '-' ~ lb_stop_ip) | to_json }}
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: {{ cluster_name }}-lan
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - {{ cluster_name }}-lan
+  nodeSelectors:
+    - matchExpressions:
+        - key: node-role.kubernetes.io/control-plane
+          operator: DoesNotExist
+  interfaces:
+{% for interface in l2_interfaces %}
+    - {{ interface | to_json }}
+{% endfor %}

@@ -1,0 +1,12 @@
+---
+# Fill in 1 control plane and >=4 workers, each with ansible_host and vm_id.
+# Keep this fleet separate from inventory/cilium.yml.
+all:
+  vars:
+    ansible_user: debian
+    ansible_ssh_private_key_file: "{{ lookup('ansible.builtin.env', 'VM_SSH_KEY_DIR') | default('/var/lib/homelab/vm-keys', true) }}/vm-{{ vm_id }}"
+  children:
+    k8s_control_plane:
+      hosts: {}
+    k8s_workers:
+      hosts: {}

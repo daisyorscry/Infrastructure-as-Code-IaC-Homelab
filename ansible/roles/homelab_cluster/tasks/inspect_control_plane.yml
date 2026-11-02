@@ -1,0 +1,77 @@
+---
+- name: Require successful preflight before inspecting control plane
+  ansible.builtin.assert:
+    that: hostvars['localhost'].cluster_preflight_passed | default(false)
+    fail_msg: Run the complete playbook without --limit, --skip-tags, or starting midway.
+
+- name: Read existing control plane files
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ cluster_kubeconfig }}"
+    - "{{ cluster_profile_path }}"
+    - /etc/kubernetes/manifests/kube-apiserver.yaml
+    - /var/lib/etcd/member
+  register: cp_files
+
+- name: Refuse an unmanaged or partially initialized control plane
+  ansible.builtin.assert:
+    that:
+      - cp_files.results[0].stat.exists == cp_files.results[1].stat.exists
+      - cp_files.results[0].stat.exists or (not cp_files.results[2].stat.exists and not cp_files.results[3].stat.exists)
+      - cluster_operation != 'join' or cp_files.results[0].stat.exists
+    fail_msg: >-
+      Join requires an initialized cluster from this playbook. Existing cluster without profile,
+      or partial kubeadm init, needs inspection. No automatic reset or adoption is performed.
+
+- name: Record whether control plane was already initialized
+  ansible.builtin.set_fact:
+    cluster_initialized: "{{ cp_files.results[0].stat.exists }}"
+
+- name: Validate initialized cluster identity and desired profile
+  when: cluster_initialized
+  block:
+    - name: Read recorded profile
+      ansible.builtin.slurp:
+        src: "{{ cluster_profile_path }}"
+      register: recorded_profile
+
+    - name: Refuse stack changes and implicit upgrades on existing clusters
+      ansible.builtin.assert:
+        that:
+          - recorded_profile.content | b64decode | from_json == cluster_record
+        fail_msg: >-
+          Cluster profile differs. Use a separate inventory/VMs for each stack.
+          These entry points initialize or add workers; upgrades and network migrations need a separate procedure.
+
+    - name: Require a healthy API and the pinned Kubernetes version
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", version, -o, json]
+      register: existing_api_version
+      changed_when: false
+
+    - name: Check server version before preparing new workers
+      ansible.builtin.assert:
+        that: (existing_api_version.stdout | from_json).serverVersion.gitVersion == 'v' ~ kubernetes_version
+
+    - name: Inspect the live network plugin before joining workers
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", get, daemonsets, -A, -o, json]
+      register: live_daemonsets
+      changed_when: false
+
+    - name: Require expected network plugin and proxy mode for join
+      ansible.builtin.assert:
+        that:
+          - "cluster_stack != 'cilium' or ('cilium' in ds_names and 'calico-node' not in ds_names and 'kube-proxy' not in ds_names)"
+          - "cluster_stack != 'istio' or ('calico-node' in ds_names and 'cilium' not in ds_names and 'kube-proxy' in ds_names)"
+      vars:
+        ds_names: "{{ (live_daemonsets.stdout | from_json)['items'] | map(attribute='metadata.name') | list }}"
+      when: cluster_operation == 'join'
+
+- name: Read cluster CA fingerprint for membership checks
+  ansible.builtin.stat:
+    path: /etc/kubernetes/pki/ca.crt
+    checksum_algorithm: sha256
+  register: control_plane_ca
+  when: cluster_initialized

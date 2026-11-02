@@ -1,0 +1,30 @@
+---
+- name: Resolve only new worker targets
+  ansible.builtin.set_fact:
+    new_workers: "{{ cluster_worker_targets | intersect(groups.get('cluster_new_nodes', [])) }}"
+
+- name: Join new workers using a short-lived token
+  when: new_workers | length > 0
+  block:
+    - name: Generate join command with one-hour lifetime
+      ansible.builtin.command:
+        argv: [kubeadm, token, create, --ttl, 1h, --print-join-command]
+      register: worker_join_command
+      changed_when: true
+      no_log: true
+
+    - name: Join each new worker using CRI-O and its inventory hostname
+      ansible.builtin.command:
+        argv: "{{ worker_join_command.stdout.split() + ['--cri-socket=' ~ cluster_cri_socket, '--node-name=' ~ item] }}"
+        creates: /etc/kubernetes/kubelet.conf
+      delegate_to: "{{ item }}"
+      loop: "{{ new_workers }}"
+      no_log: true
+
+  always:
+    - name: Revoke the bootstrap token after the join attempts
+      ansible.builtin.command:
+        argv: [kubeadm, token, delete, "{{ worker_join_command.stdout.split()[worker_join_command.stdout.split().index('--token') + 1].split('.')[0] }}"]
+      when: worker_join_command is defined and worker_join_command.stdout | default('') | length > 0
+      changed_when: true
+      no_log: true

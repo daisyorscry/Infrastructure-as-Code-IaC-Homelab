@@ -1,0 +1,14 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+.env
+*.pem
+*.key
+*.retry
+.vault_pass
+.DS_Store
+.venv/
+__pycache__/
+.pytest_cache/

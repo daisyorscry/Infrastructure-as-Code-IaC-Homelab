@@ -1,0 +1,78 @@
+---
+- name: Gather facts and verify SSH and privilege escalation
+  ansible.builtin.setup:
+
+- name: Require supported guests, kernel, and CPU architecture
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.os_family == 'Debian'
+      - ansible_facts.architecture in ['x86_64', 'aarch64']
+      - ansible_facts.kernel is version('6.1', '>=')
+      - (ansible_facts.distribution == 'Debian' and ansible_facts.distribution_major_version | int >= 12) or (ansible_facts.distribution == 'Ubuntu' and ansible_facts.distribution_version is version('24.04', '>='))
+    fail_msg: Use Debian >=12 or Ubuntu >=24.04 with kernel >=6.1, amd64/arm64, working SSH, and sudo.
+
+- name: Require stable node IP and selected L2 interfaces
+  ansible.builtin.assert:
+    that:
+      - ansible_host in ansible_facts.all_ipv4_addresses
+      - inventory_hostname == cluster_control_plane or (l2_interfaces | difference(ansible_facts.interfaces)) | length == 0
+    fail_msg: The inventory IP must belong to this VM and every L2 interface must exist on each selected worker.
+
+- name: Inspect node identity and Kubernetes state
+  ansible.builtin.slurp:
+    src: /etc/machine-id
+  register: node_machine_id
+
+- name: Read existing node membership
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    checksum_algorithm: sha256
+  loop:
+    - /etc/kubernetes/kubelet.conf
+    - /etc/kubernetes/pki/ca.crt
+    - /etc/kubernetes/admin.conf
+    - /var/lib/kubelet/config.yaml
+  register: node_files
+
+- name: Reject foreign members and partial joins before changing guests
+  ansible.builtin.assert:
+    that:
+      - node_machine_id.content | b64decode | trim is match('^[0-9a-f]{32}$')
+      - not node_files.results[0].stat.exists or hostvars[cluster_control_plane].cluster_initialized
+      - not node_files.results[0].stat.exists or node_files.results[1].stat.checksum | default('') == hostvars[cluster_control_plane].control_plane_ca.stat.checksum | default('missing')
+      - inventory_hostname == cluster_control_plane or not node_files.results[2].stat.exists
+      - node_files.results[0].stat.exists or not node_files.results[3].stat.exists
+      - not node_files.results[0].stat.exists or ansible_facts.hostname == inventory_hostname
+    fail_msg: Foreign cluster, partial join, duplicate identity, or hostname mismatch; inspect manually. No node reset is performed.
+
+- name: Refuse a duplicate hostname already registered by a different guest
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", get, nodes, -o, json]
+  delegate_to: "{{ cluster_control_plane }}"
+  register: registered_nodes
+  changed_when: false
+  when: hostvars[cluster_control_plane].cluster_initialized and not node_files.results[0].stat.exists
+
+- name: Require unused Kubernetes node name for new guests
+  ansible.builtin.assert:
+    that:
+      - inventory_hostname not in ((registered_nodes.stdout | from_json)['items'] | map(attribute='metadata.name') | list)
+      - node_machine_id.content | b64decode | trim not in ((registered_nodes.stdout | from_json)['items'] | map(attribute='status.nodeInfo.machineID') | list)
+    fail_msg: Node name or machine-id already belongs to a registered node; inspect the VM template.
+  when: hostvars[cluster_control_plane].cluster_initialized and not node_files.results[0].stat.exists
+
+- name: Verify machine IDs are unique across all selected nodes
+  ansible.builtin.assert:
+    that: identities | unique | length == identities | length
+    fail_msg: Duplicate machine-id; clean the golden VM template before cloning.
+  vars:
+    identities: "{{ cluster_node_targets | map('extract', hostvars, 'node_machine_id') | map(attribute='content') | list }}"
+  run_once: true
+
+- name: Build the group of new guests after all read-only checks pass
+  ansible.builtin.add_host:
+    name: "{{ item }}"
+    groups: cluster_new_nodes
+  loop: "{{ cluster_node_targets }}"
+  when: not hostvars[item].node_files.results[0].stat.exists
+  run_once: true

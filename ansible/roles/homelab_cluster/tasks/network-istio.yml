@@ -1,0 +1,103 @@
+---
+- name: Require absence of Cilium before installing Calico
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", get, daemonsets, -A, -o, json]
+  register: network_daemonsets
+  changed_when: false
+
+- name: Require standard kube-proxy mode and no competing CNI
+  ansible.builtin.assert:
+    that:
+      - "'cilium' not in daemonset_names"
+      - "'kube-proxy' in daemonset_names"
+  vars:
+    daemonset_names: "{{ (network_daemonsets.stdout | from_json)['items'] | map(attribute='metadata.name') | list }}"
+
+- name: Render Calico CNI configuration
+  ansible.builtin.template:
+    src: calico-values.yml.j2
+    dest: "{{ cluster_config_dir }}/calico-values.yml"
+    mode: '0600'
+
+- name: Add Calico chart repository
+  ansible.builtin.command:
+    argv: [/usr/local/bin/helm, repo, add, projectcalico, https://docs.tigera.io/calico/charts, --force-update]
+  changed_when: false
+
+- name: Update Calico chart index
+  ansible.builtin.command:
+    argv: [/usr/local/bin/helm, repo, update, projectcalico]
+  changed_when: false
+
+- name: Render Calico API CRDs for the selected Kubernetes minor
+  ansible.builtin.command:
+    argv: [/usr/local/bin/helm, template, calico-crds, projectcalico/projectcalico.org.v3, --version, "{{ calico_version }}", --api-versions, "{{ 'admissionregistration.k8s.io/v1beta1/MutatingAdmissionPolicy' if cluster_kubernetes_minor == 'v1.35' else 'admissionregistration.k8s.io/v1/MutatingAdmissionPolicy' }}"]
+  register: calico_crds
+  changed_when: false
+
+- name: Apply Calico API CRDs before the operator
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", apply, --server-side, -f, -]
+    stdin: "{{ calico_crds.stdout }}"
+  register: calico_crds_apply
+  changed_when: "'created' in calico_crds_apply.stdout or 'configured' in calico_crds_apply.stdout"
+
+- name: Install Calico operator
+  ansible.builtin.command:
+    argv: [/usr/local/bin/helm, upgrade, --install, calico, projectcalico/tigera-operator, --namespace, tigera-operator, --create-namespace, --version, "{{ calico_version }}", --values, "{{ cluster_config_dir }}/calico-values.yml", --wait, --timeout, 15m]
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig }}"
+  changed_when: true
+
+- name: Wait for Calico to report available
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", get, tigerastatus, calico, -o, json]
+  register: calico_status
+  changed_when: false
+  retries: 90
+  delay: 10
+  until: >-
+    calico_status.rc == 0 and
+    ((calico_status.stdout | from_json).status.conditions | selectattr('type', 'equalto', 'Available') | selectattr('status', 'equalto', 'True') | list | length > 0)
+
+- name: Install native MetalLB for L2 mode
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", apply, -f, "https://raw.githubusercontent.com/metallb/metallb/{{ metallb_version }}/config/manifests/metallb-native.yaml"]
+  register: metallb_apply
+  changed_when: "'created' in metallb_apply.stdout or 'configured' in metallb_apply.stdout"
+
+- name: Wait for MetalLB controller and speakers
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", -n, metallb-system, rollout, status, "{{ item }}", --timeout=300s]
+  loop: [deployment/controller, daemonset/speaker]
+  changed_when: false
+
+- name: Apply MetalLB pool and L2 advertisement after webhook readiness
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", apply, -f, -]
+    stdin: "{{ lookup('ansible.builtin.template', role_path ~ '/templates/metallb-lb.yml.j2') }}"
+  register: metallb_pool_apply
+  retries: 12
+  delay: 5
+  until: metallb_pool_apply.rc == 0
+  changed_when: "'created' in metallb_pool_apply.stdout or 'configured' in metallb_pool_apply.stdout"
+
+- name: Add Istio Helm repository
+  ansible.builtin.command:
+    argv: [/usr/local/bin/helm, repo, add, istio, https://istio-release.storage.googleapis.com/charts, --force-update]
+  changed_when: false
+
+- name: Update Istio repository index
+  ansible.builtin.command:
+    argv: [/usr/local/bin/helm, repo, update, istio]
+  changed_when: false
+
+- name: Install Istio base and istiod Gateway API controller
+  ansible.builtin.command:
+    argv: "{{ ['/usr/local/bin/helm', 'upgrade', '--install', item.release, item.chart, '--namespace', 'istio-system', '--create-namespace', '--version', istio_version, '--wait', '--timeout', '10m'] + (['--set', 'defaultRevision=default'] if item.release == 'istio-base' else []) }}"
+  loop:
+    - {release: istio-base, chart: istio/base}
+    - {release: istiod, chart: istio/istiod}
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig }}"
+  changed_when: true

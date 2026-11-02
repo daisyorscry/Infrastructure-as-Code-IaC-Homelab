@@ -1,10 +1,10 @@
 # VM Factory Ansible di Semaphore
 
-Flow aktif: **isi form → cek input/template/VMID → generate/simpan SSH key → full clone → Cloud-Init → resize disk → start → tampilkan IP jika Guest Agent siap**. Satu Run membuat satu VM baru. Tidak memerlukan workspace, JSON daftar VM, atau PostgreSQL state. OpenTofu dipending; jangan jalankan task OpenTofu untuk VM yang sama.
+Flow aktif: **isi form → cek input/template/VMID → generate/simpan SSH key → full clone → Cloud-Init → resize disk → start → tampilkan IP jika Guest Agent siap**. Satu Run membuat satu VM baru. Tidak memerlukan workspace, JSON daftar VM, atau PostgreSQL state. Konfigurasi OpenTofu sudah dihapus dari repo; gunakan task Ansible untuk provisioning berikutnya.
 
 ## Task Template
 
-Sebaiknya buat template baru agar task OpenTofu lama tetap tersimpan sebagai arsip.
+Gunakan template Ansible di bawah. Task OpenTofu lama di Semaphore tidak lagi memakai konfigurasi dari repo ini.
 
 | Field | Value |
 |---|---|

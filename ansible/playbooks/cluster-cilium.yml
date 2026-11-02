@@ -1,0 +1,77 @@
+---
+- name: Select Cilium cluster and validate the complete request
+  hosts: localhost
+  connection: local
+  tags: [preflight]
+  gather_facts: false
+  any_errors_fatal: true
+  vars_files: [../inventory/group_vars/all.yml]
+  pre_tasks:
+    - name: Select the Cilium stack
+      ansible.builtin.set_fact:
+        selected_stack: cilium
+  tasks:
+    - name: Run preflight tasks
+      ansible.builtin.import_role:
+        name: "{{ playbook_dir }}/../roles/homelab_cluster"
+        tasks_from: preflight
+
+- name: Inspect control plane before touching guests
+  hosts: k8s_control_plane
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars_files: [../inventory/group_vars/all.yml]
+  tasks:
+    - name: Run inspect_control_plane tasks
+      ansible.builtin.import_role:
+        name: "{{ playbook_dir }}/../roles/homelab_cluster"
+        tasks_from: inspect_control_plane
+
+- name: Inspect identities and membership of selected nodes
+  hosts: cluster_selected_nodes
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars_files: [../inventory/group_vars/all.yml]
+  tasks:
+    - name: Run inspect_nodes tasks
+      ansible.builtin.import_role:
+        name: "{{ playbook_dir }}/../roles/homelab_cluster"
+        tasks_from: inspect_nodes
+
+- name: Prepare only new nodes with CRI-O and Kubernetes
+  hosts: cluster_new_nodes
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars_files: [../inventory/group_vars/all.yml]
+  tasks:
+    - name: Run bootstrap tasks
+      ansible.builtin.import_role:
+        name: "{{ playbook_dir }}/../roles/homelab_cluster"
+        tasks_from: bootstrap
+
+- name: Initialize control plane and join selected workers
+  hosts: k8s_control_plane
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars_files: [../inventory/group_vars/all.yml]
+  tasks:
+    - name: Run control_plane tasks
+      ansible.builtin.import_role:
+        name: "{{ playbook_dir }}/../roles/homelab_cluster"
+        tasks_from: control_plane
+    - name: Run join tasks
+      ansible.builtin.import_role:
+        name: "{{ playbook_dir }}/../roles/homelab_cluster"
+        tasks_from: join
+    - name: Run networking tasks
+      ansible.builtin.import_role:
+        name: "{{ playbook_dir }}/../roles/homelab_cluster"
+        tasks_from: networking
+    - name: Run verify tasks
+      ansible.builtin.import_role:
+        name: "{{ playbook_dir }}/../roles/homelab_cluster"
+        tasks_from: verify

@@ -1,0 +1,57 @@
+---
+- name: Wait for every selected node to register
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", get, node, "{{ item }}", -o, name]
+  loop: "{{ cluster_node_targets }}"
+  register: node_registered
+  changed_when: false
+  retries: 30
+  delay: 5
+  until: node_registered.rc == 0
+
+- name: Wait for every selected node to be Ready
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", wait, --for=condition=Ready, "node/{{ item }}", --timeout=600s]
+  loop: "{{ cluster_node_targets }}"
+  changed_when: false
+
+- name: Verify networking daemonsets on all nodes
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", -n, "{{ item.namespace }}", rollout, status, "{{ item.resource }}", --timeout=600s]
+  loop: "{{ [{'namespace': 'kube-system', 'resource': 'daemonset/cilium'}, {'namespace': 'kube-system', 'resource': 'daemonset/cilium-envoy'}] if cluster_stack == 'cilium' else [{'namespace': 'calico-system', 'resource': 'daemonset/calico-node'}, {'namespace': 'kube-system', 'resource': 'daemonset/kube-proxy'}, {'namespace': 'metallb-system', 'resource': 'daemonset/speaker'}] }}"
+  changed_when: false
+
+- name: Verify DNS deployment readiness
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", -n, kube-system, rollout, status, deployment/coredns, --timeout=300s]
+  changed_when: false
+
+- name: Wait for Gateway to be programmed
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", -n, "{{ gateway_namespace }}", wait, --for=condition=Programmed, "gateway/{{ gateway_name }}", --timeout=600s]
+  changed_when: false
+
+- name: Read Gateway address
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", -n, "{{ gateway_namespace }}", get, gateway, "{{ gateway_name }}", -o, json]
+  register: gateway_status
+  changed_when: false
+
+- name: Require an allocated IPv4 Gateway address
+  ansible.builtin.assert:
+    that: (gateway_status.stdout | from_json).status.addresses | default([]) | selectattr('type', 'equalto', 'IPAddress') | list | length > 0
+
+- name: Get cluster node summary
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", get, nodes, -o, wide]
+  register: cluster_nodes
+  changed_when: false
+
+- name: Show cluster result without credentials
+  ansible.builtin.debug:
+    msg:
+      stack: "{{ cluster_stack }}"
+      operation: "{{ cluster_operation }}"
+      selected_workers: "{{ cluster_worker_targets }}"
+      gateway_addresses: "{{ (gateway_status.stdout | from_json).status.addresses }}"
+      nodes: "{{ cluster_nodes.stdout_lines }}"

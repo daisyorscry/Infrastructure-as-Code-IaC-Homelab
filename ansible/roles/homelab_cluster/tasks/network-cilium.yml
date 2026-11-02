@@ -1,0 +1,55 @@
+---
+- name: Require absence of kube-proxy, Calico, and MetalLB
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", get, daemonsets, -A, -o, json]
+  register: network_daemonsets
+  changed_when: false
+
+- name: Refuse network migration or competing L2 controllers
+  ansible.builtin.assert:
+    that:
+      - "'kube-proxy' not in daemonset_names"
+      - "'calico-node' not in daemonset_names"
+      - "'metallb-speaker' not in daemonset_names and 'speaker' not in daemonset_names"
+  vars:
+    daemonset_names: "{{ (network_daemonsets.stdout | from_json)['items'] | map(attribute='metadata.name') | list }}"
+
+- name: Render Cilium values with native CNI, KPR, Envoy, and L2
+  ansible.builtin.template:
+    src: cilium-values.yml.j2
+    dest: "{{ cluster_config_dir }}/cilium-values.yml"
+    mode: '0600'
+
+- name: Install Cilium and Envoy
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/helm
+      - upgrade
+      - --install
+      - cilium
+      - oci://quay.io/cilium/charts/cilium
+      - --namespace
+      - kube-system
+      - --version
+      - "{{ cilium_version }}"
+      - --values
+      - "{{ cluster_config_dir }}/cilium-values.yml"
+      - --wait
+      - --timeout
+      - 15m
+  environment:
+    KUBECONFIG: "{{ cluster_kubeconfig }}"
+  changed_when: true
+
+- name: Wait for Cilium pool and L2 CRDs
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", wait, --for=condition=Established, "crd/{{ item }}", --timeout=180s]
+  loop: [ciliumloadbalancerippools.cilium.io, ciliuml2announcementpolicies.cilium.io]
+  changed_when: false
+
+- name: Apply native Cilium IP pool and L2 policy
+  ansible.builtin.command:
+    argv: [kubectl, --kubeconfig, "{{ cluster_kubeconfig }}", apply, -f, -]
+    stdin: "{{ lookup('ansible.builtin.template', role_path ~ '/templates/cilium-lb.yml.j2') }}"
+  register: cilium_lb_apply
+  changed_when: "'created' in cilium_lb_apply.stdout or 'configured' in cilium_lb_apply.stdout"

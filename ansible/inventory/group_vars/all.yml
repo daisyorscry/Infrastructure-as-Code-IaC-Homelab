@@ -1,0 +1,25 @@
+---
+# Defaults for a NEW cluster. Override per Semaphore template through Extra vars.
+# Existing profile is checked before any guest changes; this is not an upgrade tool.
+cluster_name: homelab
+kubernetes_version: '1.35.9'
+crio_version: '1.35.10'
+helm_version: '3.20.0'
+cilium_version: '1.20.4'
+calico_version: 'v3.33.0'
+istio_version: '1.31.3'
+metallb_version: 'v0.16.1'
+gateway_api_version: 'v1.6.3'
+
+pod_cidr: 10.244.0.0/16
+service_cidr: 10.96.0.0/12
+# Fill in your LAN and a reserved LB range OUTSIDE DHCP and all other clusters.
+node_lan_cidr: CHANGE_ME
+lb_start_ip: CHANGE_ME
+lb_stop_ip: CHANGE_ME
+# Actual NIC names, not regexes. Must exist on every selected worker.
+l2_interfaces: [ens18]
+gateway_namespace: gateway-system
+gateway_name: homelab-gateway
+# Empty accepts any hostname; set a domain if desired. Initial listener is HTTP :80.
+gateway_hostname: ''

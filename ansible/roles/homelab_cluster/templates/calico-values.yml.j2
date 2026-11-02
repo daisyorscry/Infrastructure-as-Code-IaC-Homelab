@@ -1,0 +1,15 @@
+installation:
+  enabled: true
+  cni:
+    type: Calico
+  calicoNetwork:
+    linuxDataplane: Iptables
+    bgp: Disabled
+    nodeAddressAutodetectionV4:
+      kubernetes: NodeInternalIP
+    ipPools:
+      - cidr: {{ pod_cidr | to_json }}
+        blockSize: 26
+        encapsulation: VXLAN
+        natOutgoing: Enabled
+        nodeSelector: all()
