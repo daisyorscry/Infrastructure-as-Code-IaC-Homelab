@@ -27,9 +27,10 @@ class FactoryError(Exception):
 
 
 class APIError(FactoryError):
-    def __init__(self, method, path, status):
+    def __init__(self, method, path, status, reason=''):
         self.status = status
-        super().__init__(f'Proxmox {method} {path}: HTTP {status}; check runner connectivity and token permissions.')
+        detail = f' ({reason})' if reason else ''
+        super().__init__(f'Proxmox {method} {path}: HTTP {status}{detail}; check runner connectivity and token permissions.')
 
 
 class Proxmox:
@@ -57,7 +58,9 @@ class Proxmox:
                 return json.load(response)['data']
         except HTTPError as error:
             # Never include the response body or submitted parameters (Cloud-Init secrets).
-            raise APIError(method, path, error.code) from None
+            reason = str(error.reason).replace(self.token, '[redacted]')[:300]
+            error.close()
+            raise APIError(method, path, error.code, reason) from None
         except (URLError, TimeoutError, OSError):
             raise FactoryError(f'Cannot reach Proxmox {method} {path}; check endpoint, TLS, and runner routing.') from None
 
@@ -127,6 +130,8 @@ class Factory:
         self.lb_start = ipaddress.IPv4Address(cfg['lb_start_ip'])
         self.lb_stop = ipaddress.IPv4Address(cfg['lb_stop_ip'])
         self.changed = False
+        self._poll_depth = 0
+        self._active_node = None
 
     def validate(self):
         cfg = self.cfg
@@ -148,19 +153,45 @@ class Factory:
     def save(self):
         atomic_json(self.manifest_path, self.manifest)
 
+    def progress(self, message):
+        node = self._active_node
+        prefix = f"{node['name']} (VMID {node['vmid']}): " if node else ''
+        status = {'updated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                  'message': prefix + message}
+        if node:
+            status.update(name=node['name'], vmid=node['vmid'], phase=node['phase'])
+        atomic_json(self.state_dir / 'progress.json', status)
+        print('[factory] ' + status['message'], file=sys.stderr, flush=True)
+
     def poll(self, label, operation):
-        deadline = time.monotonic() + self.cfg['timeout']
-        while True:
-            try:
-                result = operation()
-                if result:
-                    return result
-            except APIError as error:
-                if error.status not in (500, 503, 595, 596):
-                    raise
-            if time.monotonic() >= deadline:
-                raise FactoryError(f'Timed out waiting for {label}; state retained at {self.manifest_path}.')
-            time.sleep(self.cfg['poll_interval'])
+        started = time.monotonic()
+        deadline = started + self.cfg['timeout']
+        last_report = started
+        self._poll_depth += 1
+        last_error = None
+        try:
+            if self._poll_depth == 1:
+                self.progress('Waiting for ' + label)
+            while True:
+                try:
+                    result = operation()
+                    if result:
+                        return result
+                except APIError as error:
+                    if error.status not in (500, 503, 595, 596):
+                        raise
+                    last_error = str(error)
+                now = time.monotonic()
+                if now >= deadline:
+                    detail = f' Last API error: {last_error}' if last_error else ''
+                    raise FactoryError(f'Timed out waiting for {label}; state retained at {self.manifest_path}.{detail}')
+                if self._poll_depth == 1 and now - last_report >= 30:
+                    detail = f'; last API error: {last_error}' if last_error else ''
+                    self.progress(f'Still waiting for {label} ({int(now - started)}s elapsed){detail}')
+                    last_report = now
+                time.sleep(self.cfg['poll_interval'])
+        finally:
+            self._poll_depth -= 1
 
     def wait_task(self, upid):
         node = upid.split(':')[1]
@@ -181,7 +212,7 @@ class Factory:
     def guest_exec(self, record, command):
         path = self.vm_path(record) + '/agent'
         pid = self.api.call('POST', path + '/exec', command=command)['pid']
-        result = self.poll('guest command on ' + record['name'],
+        result = self.poll('guest command ' + ' '.join(command[:3]) + ' on ' + record['name'],
                            lambda: self._exec_status(path, pid))
         if result.get('exitcode') != 0 or result.get('out-truncated'):
             raise FactoryError(f"Guest command {command[0]} failed on {record['name']}; inspect Cloud-Init/guest logs.")
@@ -223,6 +254,8 @@ class Factory:
         return self.api.call('GET', '/cluster/resources', type='vm')
 
     def provision(self, record):
+        self._active_node = record
+        self.progress('Continuing lifecycle phase ' + record['phase'])
         if record['phase'] not in ('planned', 'cloning', 'cloned', 'configured', 'rebooting', 'ready'):
             raise FactoryError('Unknown VM lifecycle phase; inspect the manifest before retrying.')
         path = self.vm_path(record)
@@ -241,6 +274,7 @@ class Factory:
                 self.save()
         elif record['phase'] == 'planned':
             self.key(record, create=True)
+            self.progress('Cloning template ' + str(self.cfg['template_id']))
             # Persist intent first. An interrupted API response must never cause an unsafe clone retry.
             record['phase'] = 'cloning'
             self.save()
@@ -258,6 +292,7 @@ class Factory:
         config = self.owned(record)
         public_key = self.key(record)
         if record['phase'] == 'cloned':
+            self.progress('Configuring resources and Cloud-Init DHCP')
             if self.api.call('GET', path + '/status/current')['status'] != 'stopped':
                 raise FactoryError('Unconfigured clone is already running; inspect it before retrying.')
             task = self.api.call('POST', path + '/config', cores=self.cfg['cores'], sockets=1, cpu='host',
@@ -280,11 +315,13 @@ class Factory:
             self.save()
             self.changed = True
         if self.api.call('GET', path + '/status/current')['status'] != 'running':
+            self.progress('Starting VM')
             self.wait_task(self.api.call('POST', path + '/status/start'))
             self.changed = True
         if record['phase'] == 'configured':
             self.poll('Guest Agent on ' + record['name'], lambda: self.boot_id(record))
             # No DHCP address is needed yet: Cloud-Init is awaited over authenticated QGA.
+            self.progress('Waiting for Cloud-Init before reboot')
             self.guest_exec(record, ['/usr/bin/cloud-init', 'status', '--wait'])
             record['boot_id_before'] = self.boot_id(record)
             record['phase'] = 'rebooting'
@@ -293,6 +330,7 @@ class Factory:
             current_boot = self.poll('Guest Agent before reboot', lambda: self.boot_id(record))
             if current_boot == record['boot_id_before']:
                 # Graceful reboot; never reset/power-cycle an existing guest.
+                self.progress('Requesting graceful reboot')
                 self.wait_task(self.api.call('POST', path + '/status/reboot'))
                 self.changed = True
             self.poll('a new boot ID on ' + record['name'],
@@ -303,6 +341,7 @@ class Factory:
         if record['phase'] != 'ready':
             raise FactoryError('Unknown VM lifecycle phase; inspect the manifest.')
         # Always refresh after reboot and on retry; never trust an old DHCP lease.
+        self.progress('Discovering final DHCP address in ' + str(self.lan))
         record['ip'] = self.poll('final LAN address on ' + record['name'], lambda: select_ip(
             self.api.call('GET', path + '/agent/network-get-interfaces')['result'],
             self.lan, self.lb_start, self.lb_stop))
@@ -311,6 +350,7 @@ class Factory:
         if not record['host_keys']:
             raise FactoryError('Guest has no readable SSH host public keys.')
         self.save()
+        self.progress('Ready at ' + record['ip'])
 
     def run(self):
         with (self.state_dir / '.lock').open('a') as lock:
@@ -321,6 +361,7 @@ class Factory:
             return self._run_locked()
 
     def _run_locked(self):
+        self.progress('Checking persistent state and Proxmox template')
         settings = {key: value for key, value in self.cfg.items() if key not in ('timeout', 'poll_interval')}
         # Bind identity to the API endpoint too; state must never target another PVE cluster.
         settings['endpoint'] = os.environ.get('PROXMOX_VE_ENDPOINT', '').rstrip('/')
@@ -366,6 +407,8 @@ class Factory:
         inventory['all']['vars'] = {'worker_count': self.cfg['worker_count']}
         inventory_path = self.state_dir / 'inventory.json'
         atomic_json(inventory_path, inventory)
+        self._active_node = None
+        self.progress(f'All {len(nodes)} VMs ready; generated inventory: {inventory_path}')
         return {'changed': self.changed, 'nodes': [{k: node[k] for k in ('name', 'group', 'vmid', 'ip', 'key_path')} for node in nodes],
                 'known_hosts_path': str(known_hosts), 'inventory_path': str(inventory_path)}
 

@@ -24,11 +24,9 @@
     cluster_validation_node_count: "{{ worker_count | int + 1 }}"
 
 - name: Clone, finish Cloud-Init, restart, and discover final DHCP addresses
-  ansible.builtin.command:
-    argv:
-      - "{{ ansible_playbook_python }}"
-      - "{{ playbook_dir }}/../files/provision_cluster.py"
-    stdin: "{{ factory_request | to_json }}"
+  homelab_provision:
+    script: "{{ playbook_dir }}/../files/provision_cluster.py"
+    request: "{{ factory_request }}"
   vars:
     factory_request:
       cluster_name: "{{ cluster_name }}"
@@ -49,7 +47,6 @@
       timeout: "{{ factory_timeout | int }}"
       poll_interval: "{{ factory_poll_interval | int }}"
   register: factory_result
-  changed_when: factory_result.rc == 0 and (factory_result.stdout | from_json).changed
 
 - name: Read generated inventory
   ansible.builtin.set_fact:

@@ -1,6 +1,7 @@
 """VM lifecycle tests against a fake PVE API. Never contacts infrastructure."""
 import copy
 import importlib.util
+import io
 import ipaddress
 import json
 from pathlib import Path
@@ -91,6 +92,10 @@ class FakeProxmox:
 
 class FactoryTests(unittest.TestCase):
     def setUp(self):
+        self.progress_output = io.StringIO()
+        progress_patch = patch('sys.stderr', self.progress_output)
+        progress_patch.start()
+        self.addCleanup(progress_patch.stop)
         self.tmp = tempfile.TemporaryDirectory(prefix='homelab-factory-test-')
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
@@ -126,6 +131,13 @@ class FactoryTests(unittest.TestCase):
         self.assertIn('192.168.1.101 ssh-ed25519 ', Path(result['known_hosts_path']).read_text())
         for vm in self.api.vms.values():
             self.assertEqual(vm['ipconfig0'], 'ip=dhcp')
+        progress = self.progress_output.getvalue()
+        self.assertIn('Cloning template 9201', progress)
+        self.assertIn('Requesting graceful reboot', progress)
+        self.assertIn('Discovering final DHCP address in 192.168.1.0/24', progress)
+        self.assertIn('All 5 VMs ready', progress)
+        status = json.loads((Path(result['inventory_path']).parent / 'progress.json').read_text())
+        self.assertIn('All 5 VMs ready', status['message'])
 
     def test_retry_refreshes_dhcp_without_reclone_reconfigure_or_reboot(self):
         first = self.run_factory()
@@ -207,6 +219,18 @@ class FactoryTests(unittest.TestCase):
         interfaces[0]['ip-addresses'].append({'ip-address-type': 'ipv4', 'ip-address': '192.168.1.102'})
         with self.assertRaisesRegex(factory.FactoryError, 'Multiple guest addresses'):
             factory.select_ip(interfaces, lan, start, stop)
+
+    def test_wait_reports_heartbeat_and_last_api_error_on_timeout(self):
+        self.cfg['timeout'] = 60
+        runner = factory.Factory(self.cfg, self.api)
+        failure = factory.APIError('POST', '/nodes/pve/qemu/101/agent/exec', 500,
+                                   'QEMU guest agent is not running')
+        with patch.object(factory.time, 'monotonic', side_effect=[0, 31, 61]), \
+                patch.object(factory.time, 'sleep'), \
+                self.assertRaisesRegex(factory.FactoryError, 'Last API error:.*QEMU guest agent is not running'):
+            runner.poll('Guest Agent on dev-cilium-master-1', lambda: (_ for _ in ()).throw(failure))
+        self.assertIn('Still waiting for Guest Agent on dev-cilium-master-1 (31s elapsed)',
+                      self.progress_output.getvalue())
 
 
 if __name__ == '__main__':

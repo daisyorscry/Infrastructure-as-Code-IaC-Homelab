@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 import jinja2
@@ -284,19 +285,45 @@ class ClusterTests(unittest.TestCase):
                                {'name': name, 'group': 'k8s_control_plane' if i == 0 else 'k8s_workers',
                                 'ip': f'192.168.10.{101+i}', 'vmid': 101+i,
                                 'key_path': str(Path(tmp) / f'key-{i}')} for i, name in enumerate(names)]}
-            (isolated / 'files/provision_cluster.py').write_text('print(' + repr(json.dumps(result_data)) + ')\n')
+            release = Path(tmp) / 'release-helper'
+            (isolated / 'files/provision_cluster.py').write_text(
+                "import sys, time\nfrom pathlib import Path\n"
+                "print('[factory] test VM: Cloud-Init complete; restarting', file=sys.stderr, flush=True)\n"
+                + f'while not Path({str(release)!r}).exists():\n    time.sleep(0.05)\n'
+                + 'print(' + repr(json.dumps(result_data)) + ')\n')
             inventory = Path(tmp) / 'runner.yml'
             inventory.write_text(yaml.safe_dump({'all': {'vars': {
                 'ansible_connection': 'local', 'ansible_python_interpreter': sys.executable,
             }, 'hosts': {'localhost': {}}}}))
-            env = dict(os.environ, ANSIBLE_CONFIG=str(isolated / 'ansible.cfg'), ANSIBLE_NOCOLOR='1')
-            result = subprocess.run([
+            env = dict(os.environ, ANSIBLE_CONFIG=str(isolated / 'ansible.cfg'), ANSIBLE_NOCOLOR='1',
+                       PYTHONUNBUFFERED='1')
+            command = [
                 str(Path(sys.executable).with_name('ansible-playbook')), '-i', str(inventory),
                 str(isolated / 'playbooks/cluster-cilium.yml'), '--tags', 'factory,preflight',
                 '-e', json.dumps(self.config),
-            ], cwd=isolated, env=env, capture_output=True, text=True, timeout=60)
-            output = result.stdout + result.stderr
-            self.assertEqual(result.returncode, 0, output)
+            ]
+            # The helper cannot finish until its progress reaches this test.
+            # A fallback releases it if streaming regresses, so the test can fail cleanly.
+            fallback = threading.Timer(15, release.touch)
+            streamed_before_completion = False
+            lines = []
+            try:
+                with subprocess.Popen(command, cwd=isolated, env=env, stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT, text=True) as process:
+                    fallback.start()
+                    for line in process.stdout:
+                        lines.append(line)
+                        if '[factory] test VM:' in line and not release.exists():
+                            streamed_before_completion = process.poll() is None
+                            release.touch()
+                    rc = process.wait(timeout=60)
+            finally:
+                fallback.cancel()
+            output = ''.join(lines)
+            self.assertEqual(rc, 0, output)
+            self.assertTrue(streamed_before_completion, 'Factory output was buffered until completion: ' + output)
+            self.assertIn('[factory] test VM: Cloud-Init complete; restarting', output)
+            self.assertLess(output.index('[factory] test VM:'), output.index('Read generated inventory]'))
             waits = output.split('Wait for SSH on the final post-restart addresses]')[1].split('TASK [')[0]
             self.assertNotIn('skipping:', waits)
             for name in names:
