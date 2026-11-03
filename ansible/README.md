@@ -2,28 +2,69 @@
 
 | Playbook | Tugas | Parameter form |
 |---|---|---|
-| `create-vm.yml` | VM Factory Proxmox | Form factory yang sudah ada |
-| `cluster-cilium.yml` | Buat cluster CRI-O + Cilium CNI/KPR + Envoy Gateway + LB IPAM/L2 bawaan | `worker_count`, `gateway_hostname` opsional |
-| `cluster-istio.yml` | Buat cluster CRI-O + Calico VXLAN/iptables + kube-proxy + Istio Envoy Gateway + MetalLB | `worker_count`, `gateway_hostname` opsional |
-| `add-workers.yml` | Tambah worker ke cluster yang dipilih | `master`, `workers` |
+| `cluster-cilium.yml` | Buat VM sampai cluster Cilium siap | `cluster_name`, `worker_count`, LAN/LB, `gateway_hostname` opsional |
+| `cluster-istio.yml` | Buat VM sampai cluster Calico + Istio siap | `cluster_name`, `worker_count`, LAN/LB, `gateway_hostname` opsional |
+| `add-workers.yml` | Join worker VM yang sudah tersedia | `master`, `workers` |
 
-Playbook init dan worker terpisah. Hapus parameter lama `cluster_operation` dan `join_workers` dari template Semaphore. Task internal berada di `roles/homelab_cluster/`.
+## Membuat VM dan cluster dalam satu Run
 
-## Membuat cluster
+Gunakan inventory `inventory/runner-local.yml` untuk kedua template init. Di Semaphore, inventory static juga boleh berisi:
 
-Spawn VM melalui [VM Factory](../README.md#quick-start), lalu isi `inventory/cilium.yml` atau `inventory/istio.yml`: tepat satu control plane dan setidaknya sebanyak `worker_count` worker. Setiap host punya `ansible_host` dan `vm_id`; inventory memakai key persisten factory. Gunakan VM dan pool LB berbeda untuk kedua cluster.
+```yaml
+all:
+  hosts:
+    localhost:
+      ansible_connection: local
+```
 
-`worker_count` default/minimum `4`. Playbook memilih sejumlah itu dari grup `k8s_workers` berdasarkan urutan nama. `gateway_hostname` boleh kosong agar Gateway menerima semua hostname. Tidak ada mode operasi atau parameter master/worker join pada form init.
+Form init mengirim Extra variables, contoh 10 VM untuk development:
+
+```yaml
+cluster_name: dev
+worker_count: 9
+node_lan_cidr: "192.168.1.0/24"
+lb_start_ip: "192.168.1.10"
+lb_stop_ip: "192.168.1.20"
+gateway_hostname: "runvel.dev"
+```
+
+Pakai nama variabel persis `gateway_hostname`. Biarkan `l2_interfaces: []` di YAML, bukan string dari survey. `worker_count` default/minimum `4`; master selalu satu dan tidak dihitung sebagai worker. Cilium dan Istio memakai nama VM berbeda. Pool LB kedua stack harus dipisahkan jika aktif bersamaan.
 
 ```bash
 ANSIBLE_CONFIG=ansible/ansible.cfg ansible-playbook \
-  -i ansible/inventory/cilium.yml ansible/playbooks/cluster-cilium.yml \
-  -e worker_count=4 -e gateway_hostname=app.example.com
+  -i ansible/inventory/runner-local.yml ansible/playbooks/cluster-cilium.yml \
+  -e cluster_name=dev -e worker_count=9 \
+  -e node_lan_cidr=192.168.1.0/24 \
+  -e lb_start_ip=192.168.1.10 -e lb_stop_ip=192.168.1.20
 ```
 
-Untuk Istio, ganti inventory dan playbook menjadi `istio.yml` / `cluster-istio.yml`. Flow menyiapkan guest, init master, join worker awal, memasang network stack/Gateway, lalu menunggu node Ready dan Gateway Programmed. Worker sementara NotReady sebelum CNI dipasang dalam run yang sama.
+Untuk Istio ganti playbook menjadi `cluster-istio.yml`. Alurnya:
 
-Konfigurasi LAN default `192.168.10.0/24` dengan pool LB `192.168.10.10–192.168.10.20`, di luar DHCP. Node boleh DHCP dengan reservasi MAC/IP agar `ansible_host` tetap. Konfigurasi lain dan pin versi ada di `inventory/group_vars/all.yml`; bisa dioverride lewat Extra vars template init.
+1. Validasi konfigurasi dan template sebelum membuat VM.
+2. Alokasikan VMID kosong, simpan identitas, clone template, dan konfigurasi resource, SSH key, bridge, serta Cloud-Init DHCP.
+3. Tunggu Guest Agent dan `cloud-init status --wait` melalui API Proxmox. Belum memakai IP DHCP untuk SSH.
+4. Reboot VM secara graceful, tunggu boot ID berubah, lalu tunggu Cloud-Init kembali selesai.
+5. Baca IP final dari Guest Agent. Pilih satu IPv4 dalam `node_lan_cidr`, di luar pool LB; tolak alamat ambigu atau duplikat.
+6. Baca SSH host public keys dari Guest Agent, bentuk known_hosts dan inventory, lalu tunggu SSH.
+7. Init Kubernetes, join worker, pasang network stack/Gateway, dan tunggu Ready/Programmed.
+
+Bridge dan DHCP sudah harus tersedia. Template wajib punya QEMU Guest Agent yang aktif, Cloud-Init, Python 3, iproute2, SSH, dan sudo tanpa password untuk user Cloud-Init. Token API memerlukan izin clone/config/storage/power serta guest-agent exec dan audit (nama privilege mengikuti versi Proxmox). Endpoint/token memakai environment `PROXMOX_VE_ENDPOINT` dan secret `PROXMOX_VE_API_TOKEN`; `PROXMOX_VE_INSECURE=true` hanya jika memakai TLS self-signed tanpa CA tepercaya.
+
+Default VM: node `pve`, template `9201`, storage `nvme`, bridge `vmbr1`, user `debian`, 4 core, RAM 8192 MiB, disk 30 GiB. Override lewat Extra vars; lihat `roles/homelab_factory/defaults/main.yml`. Factory menggunakan Python standard library dan `ssh-keygen`, tanpa dependensi collection tambahan.
+
+## State persisten dan retry
+
+Mount `VM_SSH_KEY_DIR` (default `/var/lib/homelab/vm-keys`), mode `0700`, berisi marker `.persistent-key-store`. Semua runner yang menjalankan cluster yang sama harus memakai volume yang sama. Matikan Allow parallel tasks di template Semaphore.
+
+Key per VM tersimpan sebagai `vm-<VMID>`. Manifest, lock, known_hosts, dan inventory aktual tersimpan di `clusters/<cluster_name>--<stack>/`. Jangan gunakan direktori checkout atau `/tmp` untuk state ini. Path inventory hasil provisioning ditampilkan saat run.
+
+Retry menggunakan VMID/key tersimpan dan memverifikasi marker kepemilikan pada deskripsi VM. VM yang sudah selesai tidak di-clone, dikonfigurasi ulang, atau di-reboot ulang; IP DHCP tetap dibaca ulang. Clone task yang tercatat ditunggu kembali. Jika respons submit clone terputus sebelum task ID tersimpan, atau VM/key hilang, flow berhenti untuk inspeksi. Tidak ada delete/reset/adopsi otomatis. Perubahan konfigurasi VM/jumlah worker pada manifest yang sama ditolak; ekspansi menggunakan flow worker. Partial kubeadm init tetap memerlukan inspeksi sesuai validasi cluster.
+
+IP node harus tetap stabil setelah Kubernetes di-init. Gunakan reservasi DHCP berdasarkan MAC VM yang dibuat factory sebelum pemakaian jangka panjang. Jika IP berubah sesudah cluster aktif, perbaiki lease/reservasi; pembacaan ulang IP bukan migrasi endpoint Kubernetes otomatis.
+
+## Memakai VM yang sudah ada
+
+Inventory `cilium.yml` dan `istio.yml` tetap merupakan contoh manual. Jika grup node sudah berisi host, factory otomatis dilewati dan alur bootstrap lama dipakai. Isi IP/VMID asli; alamat contoh bukan konfigurasi static IP. Gunakan SSH known_hosts tepercaya pada runner. Jangan pakai inventory contoh ini untuk membuat VM baru.
 
 ## Interface L2 otomatis
 
@@ -33,12 +74,12 @@ Setiap worker mendapat L2 policy/advertisement sendiri dengan selector hostname 
 
 ## Menambah worker
 
-Spawn VM baru, tambahkan host/IP/VMID ke inventory, lalu gunakan playbook worker terpisah:
+Siapkan VM worker baru, lalu gunakan inventory JSON yang diekspor factory sebagai dasar. Tambahkan host/IP/VMID worker baru dan jalankan playbook worker terpisah:
 
 ```bash
 ANSIBLE_CONFIG=ansible/ansible.cfg ansible-playbook \
-  -i ansible/inventory/cilium.yml ansible/playbooks/add-workers.yml \
-  -e master=master-1 -e workers=worker-5,worker-6
+  -i /var/lib/homelab/vm-keys/clusters/dev--cilium/inventory.json ansible/playbooks/add-workers.yml \
+  -e master=dev-cilium-master-1 -e workers=dev-cilium-worker-10,dev-cilium-worker-11
 ```
 
 `master` adalah nama host inventory dalam grup `k8s_control_plane`, bukan IP bebas. `workers` adalah nama host dalam `k8s_workers`, dipisah koma atau berupa array YAML/JSON. Inventory boleh memuat beberapa master untuk pemilihan cluster; hanya master dan worker yang dipilih yang dihubungi. Tidak ada minimum empat worker tambahan.
@@ -49,15 +90,15 @@ Ini memilih cluster tujuan untuk worker baru; bukan memindahkan worker existing 
 
 ## Prasyarat dan validasi
 
-Runner harus dapat SSH/sudo ke guest dan membaca key persisten. Guest: Debian >=12 atau Ubuntu >=24.04, kernel >=6.1, Python 3, Cloud-Init, dan iproute2. Siapkan known_hosts runner. VM Factory dan init/join tetap Run terpisah; IP belum otomatis ditulis ke inventory. Jangan pakai check mode atau `--limit`.
+Runner harus dapat SSH/sudo ke guest dan membaca key persisten. Guest: Debian >=12 atau Ubuntu >=24.04, kernel >=6.1, Python 3, Cloud-Init, dan iproute2. Siapkan known_hosts runner. Factory dan init sudah satu Run; add-workers masih memerlukan VM dan inventory yang tersedia. Jangan pakai check mode atau `--limit`.
 
 Gateway awal HTTP port 80; aplikasi memerlukan HTTPRoute. HTTPS/cert-manager/Cloudflare belum termasuk. Uji trafik dari LAN setelah memiliki route; status Ready tidak membuktikan reachability VIP dari klien.
 
 Tes lokal tanpa VM:
 
 ```bash
-ANSIBLE_CONFIG=ansible/ansible.cfg ansible-playbook -i ansible/inventory/cilium.yml ansible/playbooks/cluster-cilium.yml --syntax-check
-ANSIBLE_CONFIG=ansible/ansible.cfg ansible-playbook -i ansible/inventory/istio.yml ansible/playbooks/cluster-istio.yml --syntax-check
+ANSIBLE_CONFIG=ansible/ansible.cfg ansible-playbook -i ansible/inventory/runner-local.yml ansible/playbooks/cluster-cilium.yml --syntax-check
+ANSIBLE_CONFIG=ansible/ansible.cfg ansible-playbook -i ansible/inventory/runner-local.yml ansible/playbooks/cluster-istio.yml --syntax-check
 ANSIBLE_CONFIG=ansible/ansible.cfg ansible-playbook -i ansible/inventory/cilium.yml ansible/playbooks/add-workers.yml --syntax-check
 python -m unittest discover -s tests -v
 ```

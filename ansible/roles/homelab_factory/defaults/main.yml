@@ -1,0 +1,15 @@
+---
+# Empty runner inventory enables the factory. Existing node inventories remain supported.
+cluster_provision_vms: "{{ groups.get('k8s_control_plane', []) | length == 0 and groups.get('k8s_workers', []) | length == 0 }}"
+worker_count: 4
+node_name: pve
+template_id: 9201
+datastore_id: nvme
+bridge: vmbr1
+cloud_init_user: debian
+cores: 4
+memory_mb: 8192
+disk_gb: 30
+factory_timeout: 900
+factory_poll_interval: 5
+vm_key_directory: "{{ lookup('ansible.builtin.env', 'VM_SSH_KEY_DIR') | default('/var/lib/homelab/vm-keys', true) }}"

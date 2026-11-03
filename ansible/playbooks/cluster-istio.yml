@@ -1,4 +1,20 @@
 ---
+- name: Provision istio VMs and discover their post-restart IPs
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  tags: [factory]
+  vars_files: [../inventory/group_vars/all.yml]
+  pre_tasks:
+    - name: Select the factory stack
+      ansible.builtin.set_fact:
+        selected_stack: istio
+  tasks:
+    - name: Run the VM lifecycle before cluster initialization
+      ansible.builtin.import_role:
+        name: "{{ playbook_dir }}/../roles/homelab_factory"
+
 - name: Select Calico and Istio cluster and validate the complete request
   hosts: localhost
   connection: local

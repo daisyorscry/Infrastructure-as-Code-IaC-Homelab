@@ -215,9 +215,64 @@ class ClusterTests(unittest.TestCase):
                                         ANSIBLE_NOCOLOR='1'), capture_output=True, text=True, timeout=60)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_separate_init_worker_and_factory_entrypoints(self):
-        self.assertEqual({p.name for p in (ANSIBLE / 'playbooks').glob('*.yml')},
-                         {'create-vm.yml', 'cluster-cilium.yml', 'cluster-istio.yml', 'add-workers.yml'})
+    def test_runner_factory_validates_network_before_api_access(self):
+        for stack in ('cilium', 'istio'):
+            with self.subTest(stack=stack):
+                env = dict(os.environ, ANSIBLE_CONFIG=str(ANSIBLE / 'ansible.cfg'),
+                           PROXMOX_VE_ENDPOINT='', PROXMOX_VE_API_TOKEN='', ANSIBLE_NOCOLOR='1')
+                result = subprocess.run([
+                    str(Path(sys.executable).with_name('ansible-playbook')),
+                    '-i', str(ANSIBLE / 'inventory/runner-local.yml'),
+                    str(ANSIBLE / 'playbooks' / f'cluster-{stack}.yml'), '--tags', 'factory',
+                    '-e', json.dumps(dict(self.config, pod_cidr='192.168.0.0/16')),
+                ], cwd=ANSIBLE, env=env, capture_output=True, text=True, timeout=60)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Overlapping Pod/Service/LAN CIDRs', result.stdout + result.stderr)
+                self.assertNotIn('Clone, finish Cloud-Init', result.stdout)
+
+    def test_runner_factory_invokes_lifecycle_before_node_access(self):
+        env = dict(os.environ, ANSIBLE_CONFIG=str(ANSIBLE / 'ansible.cfg'),
+                   PROXMOX_VE_ENDPOINT='', PROXMOX_VE_API_TOKEN='', ANSIBLE_NOCOLOR='1')
+        result = subprocess.run([
+            str(Path(sys.executable).with_name('ansible-playbook')),
+            '-i', str(ANSIBLE / 'inventory/runner-local.yml'),
+            str(ANSIBLE / 'playbooks/cluster-cilium.yml'),
+            '-e', json.dumps(self.config),
+        ], cwd=ANSIBLE, env=env, capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('PROXMOX_VE_ENDPOINT must be', result.stdout + result.stderr)
+        self.assertNotIn('TASK [homelab_cluster : Read existing control plane files]', result.stdout)
+
+    def test_generated_hosts_are_waited_for_and_consumed_by_preflight(self):
+        # Replace only the PVE helper in an isolated copy. All Ansible tasks run,
+        # including delegated wait_for_connection, using local test connections.
+        with tempfile.TemporaryDirectory(prefix='homelab-flow-test-') as tmp:
+            isolated = Path(tmp) / 'ansible'
+            shutil.copytree(ANSIBLE, isolated)
+            names = ['dev-cilium-master-1'] + [f'dev-cilium-worker-{i}' for i in range(1, 5)]
+            result_data = {'changed': True, 'known_hosts_path': str(Path(tmp) / 'known_hosts'),
+                           'inventory_path': str(Path(tmp) / 'inventory.json'), 'nodes': [
+                               {'name': name, 'group': 'k8s_control_plane' if i == 0 else 'k8s_workers',
+                                'ip': f'192.168.10.{101+i}', 'vmid': 101+i,
+                                'key_path': str(Path(tmp) / f'key-{i}')} for i, name in enumerate(names)]}
+            (isolated / 'files/provision_cluster.py').write_text('print(' + repr(json.dumps(result_data)) + ')\n')
+            inventory = Path(tmp) / 'runner.yml'
+            inventory.write_text(yaml.safe_dump({'all': {'vars': {
+                'ansible_connection': 'local', 'ansible_python_interpreter': sys.executable,
+            }, 'hosts': {'localhost': {}}}}))
+            env = dict(os.environ, ANSIBLE_CONFIG=str(isolated / 'ansible.cfg'), ANSIBLE_NOCOLOR='1')
+            result = subprocess.run([
+                str(Path(sys.executable).with_name('ansible-playbook')), '-i', str(inventory),
+                str(isolated / 'playbooks/cluster-cilium.yml'), '--tags', 'factory,preflight',
+                '-e', json.dumps(self.config),
+            ], cwd=isolated, env=env, capture_output=True, text=True, timeout=60)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            waits = output.split('Wait for SSH on the final post-restart addresses]')[1].split('TASK [')[0]
+            self.assertNotIn('skipping:', waits)
+            for name in names:
+                self.assertIn(name, waits)
+            self.assertIn('All assertions passed', output)
 
 
 if __name__ == '__main__':

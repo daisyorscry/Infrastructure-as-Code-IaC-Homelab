@@ -1,0 +1,42 @@
+---
+- name: Validate pinned versions and cluster settings
+  ansible.builtin.assert:
+    that:
+      - cluster_name is match('^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')
+      - kubernetes_version is match('^1\.(35|36)\.[0-9]+$')
+      - crio_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+      - crio_version.split('.')[0:2] == kubernetes_version.split('.')[0:2]
+      - helm_version is match('^3\.[0-9]+\.[0-9]+$')
+      - gateway_api_version is match('^v[0-9]+\.[0-9]+\.[0-9]+$')
+      - cluster_stack != 'cilium' or cilium_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+      - cluster_stack != 'istio' or calico_version is match('^v[0-9]+\.[0-9]+\.[0-9]+$')
+      - cluster_stack != 'istio' or istio_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+      - cluster_stack != 'istio' or metallb_version is match('^v[0-9]+\.[0-9]+\.[0-9]+$')
+      - l2_interfaces is sequence and l2_interfaces is not string and l2_interfaces is not mapping
+      - l2_interfaces | reject('match', '^[a-zA-Z0-9_.:-]+$') | list | length == 0
+      - gateway_namespace is match('^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')
+      - gateway_name is match('^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')
+      - gateway_hostname == '' or gateway_hostname is match('^(\*\.)?[a-z0-9][a-z0-9.-]+[a-z0-9]$')
+    fail_msg: Check pinned versions, matching Kubernetes/CRI-O minor, cluster name, and gateway settings.
+
+- name: Validate IPv4 ranges and inventory with the runner standard library
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - -c
+      - |
+        import ipaddress, json, sys
+        cfg = json.loads(sys.argv[1])
+        pod = ipaddress.IPv4Network(cfg['pod'])
+        svc = ipaddress.IPv4Network(cfg['service'])
+        lan = ipaddress.IPv4Network(cfg['lan'])
+        start, stop = [ipaddress.IPv4Address(cfg[k]) for k in ('start', 'stop')]
+        assert not pod.overlaps(svc) and not pod.overlaps(lan) and not svc.overlaps(lan), 'Overlapping Pod/Service/LAN CIDRs'
+        assert start in lan and stop in lan and int(start) <= int(stop), 'LB range must be inside node LAN'
+        assert start not in (lan.network_address, lan.broadcast_address) and stop not in (lan.network_address, lan.broadcast_address), 'LB range includes reserved LAN address'
+        ips = [ipaddress.IPv4Address(ip) for ip in cfg['hosts']]
+        assert len(ips) == len(set(ips)), 'Duplicate inventory IPs'
+        assert all(ip in lan and not int(start) <= int(ip) <= int(stop) for ip in ips), 'Node IP outside LAN or inside LB pool'
+        assert pod.prefixlen <= 24 and 2 ** (24 - pod.prefixlen) >= max(len(ips), cfg['node_count']), 'Pod CIDR needs at least one /24 per inventoried node'
+      - "{{ {'pod': pod_cidr, 'service': service_cidr, 'lan': node_lan_cidr, 'start': lb_start_ip, 'stop': lb_stop_ip, 'hosts': (cluster_validation_hosts if cluster_validation_hosts is defined else (groups['k8s_control_plane'] + groups['k8s_workers']) | map('extract', hostvars, 'ansible_host') | list), 'node_count': cluster_validation_node_count | default(0) | int} | to_json }}"
+  changed_when: false

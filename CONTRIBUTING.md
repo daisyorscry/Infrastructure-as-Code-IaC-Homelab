@@ -9,8 +9,8 @@ Small, focused improvements are welcome: clearer instructions, reproducible bug 
 ```bash
 python -m pip install ansible-core==2.20.0
 export ANSIBLE_CONFIG="$PWD/ansible/ansible.cfg"
-ansible-playbook -i ansible/inventory/cilium.yml ansible/playbooks/cluster-cilium.yml --syntax-check
-ansible-playbook -i ansible/inventory/istio.yml ansible/playbooks/cluster-istio.yml --syntax-check
+ansible-playbook -i ansible/inventory/runner-local.yml ansible/playbooks/cluster-cilium.yml --syntax-check
+ansible-playbook -i ansible/inventory/runner-local.yml ansible/playbooks/cluster-istio.yml --syntax-check
 ansible-playbook -i ansible/inventory/cilium.yml ansible/playbooks/add-workers.yml --syntax-check
 python -m unittest discover -s tests -v
 ```
