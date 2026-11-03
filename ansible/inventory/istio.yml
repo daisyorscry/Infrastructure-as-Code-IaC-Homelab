@@ -1,45 +1,8 @@
 ---
-# Example dev fleet: 1 control plane and 9 workers. Replace IPs/VMIDs with actual VMs.
-# Keep this fleet separate from inventory/cilium.yml.
+# Entry inventory for cluster-istio.yml. The factory creates the VM inventory.
 all:
   vars:
     worker_count: 9
-  children:
-    k8s_control_plane:
-      vars: &node_ssh
-        ansible_user: debian
-        ansible_ssh_private_key_file: "{{ lookup('ansible.builtin.env', 'VM_SSH_KEY_DIR') | default('/var/lib/homelab/vm-keys', true) }}/vm-{{ vm_id }}"
-      hosts:
-        dev-istio-master-1:
-          ansible_host: 192.168.1.111
-          vm_id: 111
-    k8s_workers:
-      vars: *node_ssh
-      hosts:
-        dev-istio-worker-1:
-          ansible_host: 192.168.1.112
-          vm_id: 112
-        dev-istio-worker-2:
-          ansible_host: 192.168.1.113
-          vm_id: 113
-        dev-istio-worker-3:
-          ansible_host: 192.168.1.114
-          vm_id: 114
-        dev-istio-worker-4:
-          ansible_host: 192.168.1.115
-          vm_id: 115
-        dev-istio-worker-5:
-          ansible_host: 192.168.1.116
-          vm_id: 116
-        dev-istio-worker-6:
-          ansible_host: 192.168.1.117
-          vm_id: 117
-        dev-istio-worker-7:
-          ansible_host: 192.168.1.118
-          vm_id: 118
-        dev-istio-worker-8:
-          ansible_host: 192.168.1.119
-          vm_id: 119
-        dev-istio-worker-9:
-          ansible_host: 192.168.1.120
-          vm_id: 120
+  hosts:
+    localhost:
+      ansible_connection: local

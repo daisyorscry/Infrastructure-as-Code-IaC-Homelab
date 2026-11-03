@@ -230,6 +230,35 @@ class ClusterTests(unittest.TestCase):
                 self.assertIn('Overlapping Pod/Service/LAN CIDRs', result.stdout + result.stderr)
                 self.assertNotIn('Clone, finish Cloud-Init', result.stdout)
 
+    def test_static_inventory_skips_entire_factory_without_evaluating_delegate(self):
+        for stack in ('cilium', 'istio'):
+            with self.subTest(stack=stack), tempfile.TemporaryDirectory() as tmp:
+                inventory = Path(tmp) / 'existing.yml'
+                inventory.write_text(yaml.safe_dump(self.inventory))
+                result = subprocess.run([
+                    str(Path(sys.executable).with_name('ansible-playbook')), '-i', str(inventory),
+                    str(ANSIBLE / 'playbooks' / f'cluster-{stack}.yml'), '--tags', 'factory',
+                ], cwd=ANSIBLE, env=dict(os.environ, ANSIBLE_CONFIG=str(ANSIBLE / 'ansible.cfg'),
+                                        ANSIBLE_NOCOLOR='1'), capture_output=True, text=True, timeout=60)
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 0, output)
+                self.assertIn('VM provisioning is disabled', output)
+                self.assertNotIn('Wait for SSH on the final post-restart addresses', output)
+                self.assertNotIn('Read generated inventory', output)
+
+    def test_explicit_false_override_skips_factory_with_empty_runner(self):
+        result = subprocess.run([
+            str(Path(sys.executable).with_name('ansible-playbook')),
+            '-i', str(ANSIBLE / 'inventory/runner-local.yml'),
+            str(ANSIBLE / 'playbooks/cluster-cilium.yml'), '--tags', 'factory',
+            '-e', json.dumps({'cluster_provision_vms': False}),
+        ], cwd=ANSIBLE, env=dict(os.environ, ANSIBLE_CONFIG=str(ANSIBLE / 'ansible.cfg'),
+                                ANSIBLE_NOCOLOR='1'), capture_output=True, text=True, timeout=60)
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn('VM provisioning is disabled', output)
+        self.assertNotIn('Wait for SSH on the final post-restart addresses', output)
+
     def test_runner_factory_invokes_lifecycle_before_node_access(self):
         env = dict(os.environ, ANSIBLE_CONFIG=str(ANSIBLE / 'ansible.cfg'),
                    PROXMOX_VE_ENDPOINT='', PROXMOX_VE_API_TOKEN='', ANSIBLE_NOCOLOR='1')

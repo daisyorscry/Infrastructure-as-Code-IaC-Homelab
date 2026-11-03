@@ -64,7 +64,7 @@ IP node harus tetap stabil setelah Kubernetes di-init. Gunakan reservasi DHCP be
 
 ## Memakai VM yang sudah ada
 
-Inventory `cilium.yml` dan `istio.yml` tetap merupakan contoh manual. Jika grup node sudah berisi host, factory otomatis dilewati dan alur bootstrap lama dipakai. Isi IP/VMID asli; alamat contoh bukan konfigurasi static IP. Gunakan SSH known_hosts tepercaya pada runner. Jangan pakai inventory contoh ini untuk membuat VM baru.
+Inventory `cilium.yml` dan `istio.yml` sekarang berisi `localhost` dengan default `worker_count: 9`, sehingga masing-masing memicu pembuatan 1 master + 9 worker. `runner-local.yml` juga dapat dipakai; jumlah worker mengikuti default role atau survey. Untuk memakai VM existing tanpa provisioning, sediakan inventory terpisah dengan grup `k8s_control_plane` dan `k8s_workers`, IP/VMID asli, serta konfigurasi SSH. Factory otomatis dilewati ketika grup node sudah terisi.
 
 ## Interface L2 otomatis
 

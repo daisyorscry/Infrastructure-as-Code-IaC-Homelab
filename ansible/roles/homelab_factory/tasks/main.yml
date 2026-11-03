@@ -3,87 +3,18 @@
   ansible.builtin.set_fact:
     factory_should_provision: "{{ cluster_provision_vms | bool }}"
 
+- name: Explain why VM provisioning is disabled
+  ansible.builtin.debug:
+    msg: >-
+      VM provisioning is disabled. Existing k8s_control_plane/k8s_workers groups
+      select bootstrap of existing VMs, or cluster_provision_vms was set false.
+      To create VMs use a localhost-only runner inventory and remove any false override.
+      Semaphore static inventories must be updated in Semaphore itself.
+  when: not factory_should_provision
+
 - name: Provision the selected stack before any node access
+  ansible.builtin.include_tasks:
+    file: provision.yml
+    apply:
+      tags: [factory]
   when: factory_should_provision
-  block:
-    - name: Require a complete factory request and runner-only inventory
-      ansible.builtin.assert:
-        that:
-          - not ansible_check_mode
-          - ansible_limit | default('') | length == 0
-          - cluster_operation is not defined
-          - join_workers is not defined
-          - master | default('') | length == 0
-          - workers | default('') | length == 0
-          - groups.get('k8s_control_plane', []) | length == 0
-          - groups.get('k8s_workers', []) | length == 0
-          - worker_count | string is match('^[0-9]+$')
-          - worker_count | int >= 4
-          - worker_count | int <= 999
-        fail_msg: Use runner-local inventory, worker_count >=4, and run the complete init playbook without check mode or --limit.
-
-    - name: Validate cluster settings before creating VMs
-      ansible.builtin.include_role:
-        name: "{{ playbook_dir }}/../roles/homelab_cluster"
-        tasks_from: validate_settings
-      vars:
-        cluster_validation_hosts: []
-        cluster_validation_node_count: "{{ worker_count | int + 1 }}"
-
-    - name: Clone, finish Cloud-Init, restart, and discover final DHCP addresses
-      ansible.builtin.command:
-        argv:
-          - "{{ ansible_playbook_python }}"
-          - "{{ playbook_dir }}/../files/provision_cluster.py"
-        stdin: "{{ factory_request | to_json }}"
-      vars:
-        factory_request:
-          cluster_name: "{{ cluster_name }}"
-          stack: "{{ selected_stack }}"
-          worker_count: "{{ worker_count | int }}"
-          node_name: "{{ node_name }}"
-          template_id: "{{ template_id | int }}"
-          datastore_id: "{{ datastore_id }}"
-          bridge: "{{ bridge }}"
-          cloud_init_user: "{{ cloud_init_user }}"
-          cores: "{{ cores | int }}"
-          memory_mb: "{{ memory_mb | int }}"
-          disk_gb: "{{ disk_gb | int }}"
-          node_lan_cidr: "{{ node_lan_cidr }}"
-          lb_start_ip: "{{ lb_start_ip }}"
-          lb_stop_ip: "{{ lb_stop_ip }}"
-          key_directory: "{{ vm_key_directory }}"
-          timeout: "{{ factory_timeout | int }}"
-          poll_interval: "{{ factory_poll_interval | int }}"
-      register: factory_result
-      changed_when: (factory_result.stdout | from_json).changed
-
-    - name: Read generated inventory
-      ansible.builtin.set_fact:
-        factory_inventory: "{{ factory_result.stdout | from_json }}"
-
-    - name: Register provisioned nodes with their final IP and persistent SSH identity
-      ansible.builtin.add_host:
-        name: "{{ item.name }}"
-        groups: "{{ item.group }}"
-        ansible_host: "{{ item.ip }}"
-        vm_id: "{{ item.vmid }}"
-        ansible_user: "{{ cloud_init_user }}"
-        ansible_ssh_private_key_file: "{{ item.key_path }}"
-        ansible_ssh_common_args: "-o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ factory_inventory.known_hosts_path | quote }}"
-      loop: "{{ factory_inventory.nodes }}"
-      loop_control:
-        label: "{{ item.name }} ({{ item.ip }})"
-
-    - name: Wait for SSH on the final post-restart addresses
-      ansible.builtin.wait_for_connection:
-        timeout: "{{ factory_timeout | int }}"
-        sleep: 5
-      delegate_to: "{{ item.name }}"
-      loop: "{{ factory_inventory.nodes }}"
-      loop_control:
-        label: "{{ item.name }}"
-
-    - name: Show persistent factory inventory location
-      ansible.builtin.debug:
-        msg: "VM lifecycle complete. Inventory: {{ factory_inventory.inventory_path }}"
