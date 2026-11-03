@@ -33,6 +33,20 @@ class APIError(FactoryError):
         super().__init__(f'Proxmox {method} {path}: HTTP {status}{detail}; check runner connectivity and token permissions.')
 
 
+class GuestProcessLost(FactoryError):
+    pass
+
+
+def fresh_nic(template_net0, bridge, mac):
+    # Keep the template's VLAN/trunk and NIC tuning, but replace its identity.
+    properties = dict(part.split('=', 1) for part in template_net0.split(',') if '=' in part)
+    for key in ('virtio', 'e1000', 'e1000e', 'rtl8139', 'vmxnet3', 'ne2k_pci', 'pcnet', 'macaddr', 'model'):
+        properties.pop(key, None)
+    properties['bridge'] = bridge
+    properties.pop('link_down', None)
+    return ','.join([f'virtio={mac}'] + [f'{key}={value}' for key, value in properties.items()])
+
+
 class Proxmox:
     def __init__(self, endpoint, token, insecure=False):
         parsed = urlsplit(endpoint)
@@ -209,21 +223,77 @@ class Factory:
     def vm_path(self, record):
         return f"{self.base}/{record['vmid']}"
 
-    def guest_exec(self, record, command):
+    def guest_exec(self, record, command, retry_lost=False):
         path = self.vm_path(record) + '/agent'
-        pid = self.api.call('POST', path + '/exec', command=command)['pid']
+        pid = None
+
+        def execute():
+            nonlocal pid
+            if pid is None:
+                pid = self.api.call('POST', path + '/exec', command=command)['pid']
+            try:
+                return self._exec_status(path, pid)
+            except GuestProcessLost:
+                if not retry_lost:
+                    raise
+                self.progress('Guest Agent lost a read-only command PID; submitting a new status query')
+                pid = None
+                return None
+
         result = self.poll('guest command ' + ' '.join(command[:3]) + ' on ' + record['name'],
-                           lambda: self._exec_status(path, pid))
+                           execute)
         if result.get('exitcode') != 0 or result.get('out-truncated'):
             raise FactoryError(f"Guest command {command[0]} failed on {record['name']}; inspect Cloud-Init/guest logs.")
         return result.get('out-data', '')
 
     def _exec_status(self, path, pid):
-        status = self.api.call('GET', path + '/exec-status', pid=pid)
+        try:
+            status = self.api.call('GET', path + '/exec-status', pid=pid)
+        except APIError as error:
+            if error.status == 500 and re.search(r"invalid parameter ['\"]pid['\"]", str(error), re.I):
+                raise GuestProcessLost('Guest Agent no longer tracks the command PID (agent/VM may have restarted).') from None
+            raise
         return status if status.get('exited') else None
 
+    def wait_cloud_init(self, record):
+        def completed():
+            output = self.guest_exec(record, ['/usr/bin/cloud-init', 'status', '--format=json'], retry_lost=True)
+            try:
+                status = json.loads(output)['status']
+            except (ValueError, KeyError, TypeError):
+                raise FactoryError('Cloud-Init returned invalid status JSON on ' + record['name']) from None
+            if status == 'done':
+                return True
+            if status == 'running':
+                return None
+            raise FactoryError(f'Cloud-Init status is {status} on {record["name"]}; inspect its guest logs.')
+        self.poll('Cloud-Init completion on ' + record['name'], completed)
+
+    def clean_network_identity(self, record):
+        self.progress('Resetting cloned machine-id, Cloud-Init network state, and DHCP leases before reboot')
+        # --configs is unavailable in some supported Debian 12 cloud-init versions.
+        self.guest_exec(record, ['/usr/bin/cloud-init', 'clean', '--machine-id'])
+        # All paths are inside this run's fresh guest; the source template is untouched.
+        cleanup = """from pathlib import Path
+dbus = Path('/var/lib/dbus/machine-id')
+if not dbus.is_symlink():
+    dbus.unlink(missing_ok=True)
+for pattern in ('/var/lib/dhcp/*.leases', '/var/lib/dhcp/*.leases~',
+                '/var/lib/NetworkManager/*lease*', '/run/systemd/netif/leases/*',
+                '/etc/netplan/50-cloud-init.yaml', '/etc/network/interfaces.d/50-cloud-init',
+                '/etc/systemd/network/*cloud-init*.network',
+                '/etc/NetworkManager/system-connections/cloud-init-*.nmconnection'):
+    import glob
+    for name in glob.glob(pattern):
+        path = Path(name)
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+Path('/var/lib/NetworkManager/secret_key').unlink(missing_ok=True)
+"""
+        self.guest_exec(record, ['/usr/bin/python3', '-c', cleanup])
+
     def boot_id(self, record):
-        value = self.guest_exec(record, ['/bin/cat', '/proc/sys/kernel/random/boot_id']).strip()
+        value = self.guest_exec(record, ['/bin/cat', '/proc/sys/kernel/random/boot_id'], retry_lost=True).strip()
         if not re.fullmatch(r'[0-9a-f-]{36}', value):
             raise FactoryError('Guest Agent returned an invalid boot ID.')
         return value
@@ -280,7 +350,8 @@ class Factory:
                 raise FactoryError('Unconfigured clone is already running; inspect it before retrying.')
             task = self.api.call('POST', path + '/config', cores=self.cfg['cores'], sockets=1, cpu='host',
                           memory=self.cfg['memory_mb'], balloon=0, onboot=1, agent='enabled=1',
-                          net0='virtio,bridge=' + self.cfg['bridge'],
+                          net0=fresh_nic(config['net0'], self.cfg['bridge'], record['mac']),
+                          smbios1='uuid=' + record['firmware_uuid'],
                           ciuser=self.cfg['cloud_init_user'],
                           sshkeys=quote(public_key, safe=''), ipconfig0='ip=dhcp',
                           tags=f"iac;homelab-{self.cfg['stack']}")
@@ -305,7 +376,8 @@ class Factory:
             self.poll('Guest Agent on ' + record['name'], lambda: self.boot_id(record))
             # No DHCP address is needed yet: Cloud-Init is awaited over authenticated QGA.
             self.progress('Waiting for Cloud-Init before reboot')
-            self.guest_exec(record, ['/usr/bin/cloud-init', 'status', '--wait'])
+            self.wait_cloud_init(record)
+            self.clean_network_identity(record)
             record['boot_id_before'] = self.boot_id(record)
             record['phase'] = 'rebooting'
             self.save()
@@ -318,7 +390,7 @@ class Factory:
                 self.changed = True
             self.poll('a new boot ID on ' + record['name'],
                       lambda: self.boot_id(record) != record['boot_id_before'])
-            self.guest_exec(record, ['/usr/bin/cloud-init', 'status', '--wait'])
+            self.wait_cloud_init(record)
             record['phase'] = 'ready'
             self.save()
         if record['phase'] != 'ready':
@@ -328,7 +400,12 @@ class Factory:
         record['ip'] = self.poll('final LAN address on ' + record['name'], lambda: select_ip(
             self.api.call('GET', path + '/agent/network-get-interfaces')['result'],
             self.lan, self.lb_start, self.lb_stop))
-        keys = self.guest_exec(record, ['/bin/sh', '-c', 'cat /etc/ssh/ssh_host_*_key.pub']).splitlines()
+        record['machine_id'] = self.guest_exec(record, ['/bin/cat', '/etc/machine-id'], retry_lost=True).strip()
+        if not re.fullmatch(r'[0-9a-f]{32}', record['machine_id']):
+            raise FactoryError('Guest machine-id was not regenerated correctly after reboot.')
+        if any(node is not record and node.get('machine_id') == record['machine_id'] for node in self.manifest['nodes'].values()):
+            raise FactoryError('Duplicate machine-id after reboot; inspect the template identity settings.')
+        keys = self.guest_exec(record, ['/bin/sh', '-c', 'cat /etc/ssh/ssh_host_*_key.pub'], retry_lost=True).splitlines()
         record['host_keys'] = [key.strip() for key in keys if re.match(r'^(ssh-ed25519|ssh-rsa|ecdsa-sha2-\S+) [A-Za-z0-9+/=]+(?: |$)', key)]
         if not record['host_keys']:
             raise FactoryError('Guest has no readable SSH host public keys.')
@@ -372,6 +449,8 @@ class Factory:
             if vmid == self.cfg['template_id'] or any(vm['vmid'] == vmid for vm in self.manifest['nodes'].values()):
                 raise FactoryError('Allocated VMID conflicts with this run; inspect Proxmox.')
             self.manifest['nodes'][name] = {'name': name, 'group': group, 'vmid': vmid,
+                'mac': '02:' + ':'.join(f'{part:02x}' for part in uuid.uuid4().bytes[:5]),
+                'firmware_uuid': str(uuid.uuid4()),
                 'owner': f"homelab-factory:{self.manifest['owner_id']}:{name}", 'phase': 'planned'}
             self.save()
             self.provision(self.manifest['nodes'][name])

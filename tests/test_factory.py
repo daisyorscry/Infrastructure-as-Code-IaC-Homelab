@@ -23,6 +23,9 @@ class FakeProxmox:
         self.next_pid = 1
         self.fail_cloud_init = False
         self.fail_clone_wait = False
+        self.lose_status_pid_once = False
+        self.lose_cleanup_pid_once = False
+        self.cloud_init_running_once = False
         self.ip_prefix = '192.168.1'
         self.template = {'template': 1, 'scsi0': 'nvme:base-9201,size=20G',
                          'ide2': 'nvme:cloudinit,media=cdrom', 'net0': 'virtio,bridge=vmbr1'}
@@ -65,14 +68,24 @@ class FakeProxmox:
             vm['status'] = 'running'
             return 'UPID:pve:start'
         if action == 'status/reboot':
+            assert vm.get('identity_cleaned') and vm.get('leases_cleaned')
             vm['boot_id'] = '22222222-2222-2222-2222-222222222222'
             return 'UPID:pve:reboot'
         if action == 'agent/exec':
             command = params['command']
             if command[0] == '/bin/cat':
-                output, rc = vm['boot_id'], 0
+                output, rc = (f'{vmid:032x}' if command[1] == '/etc/machine-id' else vm['boot_id']), 0
             elif command[0] == '/usr/bin/cloud-init':
-                output, rc = 'status: done', 1 if self.fail_cloud_init else 0
+                if command[1] == 'clean':
+                    vm['identity_cleaned'] = True
+                    output, rc = '', 0
+                else:
+                    state = 'running' if self.cloud_init_running_once else 'done'
+                    self.cloud_init_running_once = False
+                    output, rc = json.dumps({'status': state}), 1 if self.fail_cloud_init else 0
+            elif command[0] == '/usr/bin/python3':
+                vm['leases_cleaned'] = True
+                output, rc = '', 0
             elif command[0] == '/bin/sh':
                 output, rc = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKey root@vm', 0
             else:
@@ -80,9 +93,18 @@ class FakeProxmox:
             pid = self.next_pid
             self.next_pid += 1
             self.commands[pid] = {'exited': 1, 'exitcode': rc, 'out-data': output}
+            if command[:2] == ['/usr/bin/cloud-init', 'status'] and self.lose_status_pid_once:
+                self.lose_status_pid_once = False
+                self.commands[pid] = None
+            if command[:2] == ['/usr/bin/cloud-init', 'clean'] and self.lose_cleanup_pid_once:
+                self.lose_cleanup_pid_once = False
+                self.commands[pid] = None
             return {'pid': pid}
         if action == 'agent/exec-status':
-            return self.commands[params['pid']]
+            status = self.commands[params['pid']]
+            if status is None:
+                raise factory.APIError(method, path, 500, "Agent error: Invalid parameter 'pid'")
+            return status
         if action == 'agent/network-get-interfaces':
             # Fail the test if addresses are queried before the mandatory restart.
             assert vm['boot_id'].startswith('2222')
@@ -132,6 +154,12 @@ class FactoryTests(unittest.TestCase):
         self.assertIn('192.168.1.101 ssh-ed25519 ', Path(result['known_hosts_path']).read_text())
         for vm in self.api.vms.values():
             self.assertEqual(vm['ipconfig0'], 'ip=dhcp')
+            self.assertTrue(vm['identity_cleaned'])
+            self.assertTrue(vm['leases_cleaned'])
+        nics = [vm['net0'].split(',')[0] for vm in self.api.vms.values()]
+        self.assertEqual(len(set(nics)), 5)
+        self.assertTrue(all(nic.startswith('virtio=02:') for nic in nics))
+        self.assertEqual(len({vm['smbios1'] for vm in self.api.vms.values()}), 5)
         progress = self.progress_output.getvalue()
         self.assertIn('Cloning template 9201', progress)
         self.assertIn('Requesting graceful reboot', progress)
@@ -265,6 +293,36 @@ class FactoryTests(unittest.TestCase):
             runner.poll('Guest Agent on dev-cilium-master-1', lambda: (_ for _ in ()).throw(failure))
         self.assertIn('Still waiting for Guest Agent on dev-cilium-master-1 (31s elapsed)',
                       self.progress_output.getvalue())
+
+    def test_status_poll_recovers_lost_pid_and_waits_for_cloud_init(self):
+        self.api.lose_status_pid_once = True
+        self.api.cloud_init_running_once = True
+        with patch.object(factory.time, 'sleep'):
+            result = self.run_factory()
+        self.assertEqual(len(result['nodes']), 5)
+        self.assertIn('submitting a new status query', self.progress_output.getvalue())
+        commands = [args['command'] for method, path, args in self.api.events if path.endswith('/agent/exec')]
+        self.assertNotIn(['/usr/bin/cloud-init', 'status', '--wait'], commands)
+
+    def test_lost_mutating_command_pid_is_not_silently_retried(self):
+        self.api.lose_cleanup_pid_once = True
+        with self.assertRaisesRegex(factory.GuestProcessLost, 'no longer tracks'):
+            self.run_factory()
+        clean_calls = [args for _, path, args in self.api.events if path.endswith('/agent/exec')
+                       and args['command'][:2] == ['/usr/bin/cloud-init', 'clean']]
+        self.assertEqual(len(clean_calls), 1)
+
+    def test_template_vlan_and_trunk_are_retained_with_fresh_identity(self):
+        self.api.template['net0'] = 'virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,tag=10,trunks=20;30,firewall=1'
+        result = self.run_factory()
+        for vm in self.api.vms.values():
+            self.assertIn('bridge=vmbr1', vm['net0'])
+            self.assertIn('tag=10', vm['net0'])
+            self.assertIn('trunks=20;30', vm['net0'])
+            self.assertIn('firewall=1', vm['net0'])
+            self.assertNotIn('AA:BB:CC:DD:EE:FF', vm['net0'])
+        manifest = json.loads((Path(result['inventory_path']).parent / 'manifest.json').read_text())
+        self.assertEqual(len({node['machine_id'] for node in manifest['nodes'].values()}), 5)
 
 
 if __name__ == '__main__':

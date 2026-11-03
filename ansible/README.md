@@ -41,9 +41,9 @@ ANSIBLE_CONFIG=ansible/ansible.cfg ansible-playbook \
 Untuk Istio ganti playbook menjadi `cluster-istio.yml`. Alurnya:
 
 1. Validasi konfigurasi dan template sebelum membuat VM.
-2. Alokasikan VMID kosong, simpan identitas, clone template, dan konfigurasi resource, SSH key, bridge, serta Cloud-Init DHCP.
-3. Tunggu Guest Agent dan `cloud-init status --wait` melalui API Proxmox. Belum memakai IP DHCP untuk SSH.
-4. Reboot VM secara graceful, tunggu boot ID berubah, lalu tunggu Cloud-Init kembali selesai.
+2. Alokasikan VMID kosong, simpan identitas, clone template, dan konfigurasi resource, SSH key, MAC/SMBIOS UUID baru, bridge, serta Cloud-Init DHCP. Tag VLAN/trunk dan tuning NIC dari template dipertahankan.
+3. Tunggu Guest Agent dan poll `cloud-init status --format=json` melalui API Proxmox sampai `done`. Query pendek dapat diulang jika Guest Agent kehilangan PID setelah restart; command yang mengubah guest tidak diulang otomatis. Belum memakai IP DHCP untuk SSH.
+4. Setelah Cloud-Init selesai, bersihkan cache Cloud-Init, machine-id/D-Bus ID lama, config jaringan yang dihasilkan Cloud-Init, dan lease DHCP pada VM baru. Reboot secara graceful, tunggu boot ID berubah, lalu tunggu Cloud-Init selesai kembali. Verifikasi machine-id hasil boot unik sebelum init Kubernetes. Template sumber tidak diubah.
 5. Baca IP final dari Guest Agent. Pilih satu IPv4 dalam `node_lan_cidr`, di luar pool LB; tolak alamat ambigu atau duplikat.
 6. Baca SSH host public keys dari Guest Agent, bentuk known_hosts dan inventory, lalu tunggu SSH.
 7. Init Kubernetes, join worker, pasang network stack/Gateway, dan tunggu Ready/Programmed.
@@ -51,6 +51,8 @@ Untuk Istio ganti playbook menjadi `cluster-istio.yml`. Alurnya:
 Bridge dan DHCP sudah harus tersedia. Template wajib punya QEMU Guest Agent yang aktif, Cloud-Init, Python 3, iproute2, SSH, dan sudo tanpa password untuk user Cloud-Init. Token API memerlukan izin clone/config/storage/power serta guest-agent exec dan audit (nama privilege mengikuti versi Proxmox). Endpoint/token memakai environment `PROXMOX_VE_ENDPOINT` dan secret `PROXMOX_VE_API_TOKEN`; `PROXMOX_VE_INSECURE=true` hanya jika memakai TLS self-signed tanpa CA tepercaya.
 
 Default VM: node `pve`, template `9201`, storage `nvme`, bridge `vmbr1`, user `debian`, 4 core, RAM 8192 MiB, disk 30 GiB. Override lewat Extra vars; lihat `roles/homelab_factory/defaults/main.yml`. Factory menggunakan Python standard library dan `ssh-keygen`, tanpa dependensi collection tambahan.
+
+Trunk/VLAN bukan mekanisme meminta IP baru. Jika template memiliki `tag`/`trunks`, factory mempertahankannya; tanpa itu NIC tetap untagged. Bridge/uplink Proxmox harus mendukung VLAN yang digunakan template. Identitas MAC dan machine-id baru membantu DHCP mengenali clone sebagai klien berbeda; server DHCP tetap menentukan alamat dan dapat memakai kembali IP yang sudah bebas. Template sebaiknya sudah dibersihkan dari identitas/lease sebelum dijadikan golden image untuk menghindari bentrok pada boot awal, sebelum factory mendapat akses Guest Agent.
 
 ## Fresh provisioning dan catatan persisten
 
