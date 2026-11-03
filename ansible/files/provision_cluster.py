@@ -2,7 +2,7 @@
 """Proxmox VM lifecycle for cluster init. Standard library only; JSON in/out.
 
 Tokens/passwords come only from the runner environment. No VM is deleted or
-adopted. A durable manifest and clone-time ownership marker gate every mutation.
+adopted. Each run creates a fresh fleet; manifests are audit records, not resume state.
 """
 import fcntl
 import ipaddress
@@ -235,7 +235,7 @@ class Factory:
         return config
 
     def key(self, record, create=False):
-        path = self.root / f"vm-{record['vmid']}"
+        path = self.root / f"vm-{record['vmid']}-{self.manifest['owner_id']}"
         if not path.exists():
             if not create:
                 raise FactoryError(f'Missing retained SSH key {path}; refusing to replace an existing VM identity.')
@@ -255,40 +255,23 @@ class Factory:
 
     def provision(self, record):
         self._active_node = record
-        self.progress('Continuing lifecycle phase ' + record['phase'])
-        if record['phase'] not in ('planned', 'cloning', 'cloned', 'configured', 'rebooting', 'ready'):
-            raise FactoryError('Unknown VM lifecycle phase; inspect the manifest before retrying.')
+        self.progress('Creating fresh VM')
         path = self.vm_path(record)
-        existing = [vm for vm in self.inventory_vms() if int(vm['vmid']) == record['vmid']]
-        if existing:
-            if existing[0].get('node') != self.cfg['node_name'] or existing[0].get('type') != 'qemu':
-                raise FactoryError('Recorded VMID belongs to a different node or resource type.')
-            self.owned(record)
-            if record['phase'] == 'planned':
-                raise FactoryError('VM exists before recorded clone submission; refusing adoption.')
-            if record['phase'] == 'cloning':
-                if not record.get('clone_task'):
-                    raise FactoryError('Clone submission was interrupted; inspect VM/task before retrying. No VM adopted.')
-                self.wait_task(record['clone_task'])
-                record['phase'] = 'cloned'
-                self.save()
-        elif record['phase'] == 'planned':
-            self.key(record, create=True)
-            self.progress('Cloning template ' + str(self.cfg['template_id']))
-            # Persist intent first. An interrupted API response must never cause an unsafe clone retry.
-            record['phase'] = 'cloning'
-            self.save()
-            record['clone_task'] = self.api.call('POST', f"{self.base}/{self.cfg['template_id']}/clone",
-                                                 newid=record['vmid'], name=record['name'],
-                                                 description=record['owner'], full=1,
-                                                 storage=self.cfg['datastore_id'])
-            self.save()
-            self.wait_task(record['clone_task'])
-            record['phase'] = 'cloned'
-            self.save()
-            self.changed = True
-        else:
-            raise FactoryError(f"Recorded VMID {record['vmid']} is missing; no automatic replacement. Inspect {self.manifest_path}.")
+        if any(int(vm['vmid']) == record['vmid'] for vm in self.inventory_vms()):
+            raise FactoryError(f"VMID {record['vmid']} was allocated by another operation; no existing VM modified.")
+        self.key(record, create=True)
+        self.progress('Cloning template ' + str(self.cfg['template_id']))
+        record['phase'] = 'cloning'
+        self.save()
+        record['clone_task'] = self.api.call('POST', f"{self.base}/{self.cfg['template_id']}/clone",
+                                           newid=record['vmid'], name=record['name'],
+                                           description=record['owner'], full=1,
+                                           storage=self.cfg['datastore_id'])
+        self.save()
+        self.wait_task(record['clone_task'])
+        record['phase'] = 'cloned'
+        self.save()
+        self.changed = True
         config = self.owned(record)
         public_key = self.key(record)
         if record['phase'] == 'cloned':
@@ -303,7 +286,7 @@ class Factory:
                           tags=f"iac;homelab-{self.cfg['stack']}")
             if task:
                 self.wait_task(task)
-            # Absolute size makes a retry after a successful resize safe.
+            # Grow the fresh clone to the requested absolute size.
             current_size = disk_size_gib(config)
             if self.cfg['disk_gb'] < current_size:
                 raise FactoryError('Requested disk is smaller than the clone; shrinking is never attempted.')
@@ -340,7 +323,7 @@ class Factory:
             self.save()
         if record['phase'] != 'ready':
             raise FactoryError('Unknown VM lifecycle phase; inspect the manifest.')
-        # Always refresh after reboot and on retry; never trust an old DHCP lease.
+        # Discover the final address only after the fresh VM has restarted.
         self.progress('Discovering final DHCP address in ' + str(self.lan))
         record['ip'] = self.poll('final LAN address on ' + record['name'], lambda: select_ip(
             self.api.call('GET', path + '/agent/network-get-interfaces')['result'],
@@ -361,36 +344,36 @@ class Factory:
             return self._run_locked()
 
     def _run_locked(self):
-        self.progress('Checking persistent state and Proxmox template')
-        settings = {key: value for key, value in self.cfg.items() if key not in ('timeout', 'poll_interval')}
-        # Bind identity to the API endpoint too; state must never target another PVE cluster.
-        settings['endpoint'] = os.environ.get('PROXMOX_VE_ENDPOINT', '').rstrip('/')
-        if self.manifest_path.exists():
-            self.manifest = json.loads(self.manifest_path.read_text())
-            if self.manifest.get('schema') != 1 or self.manifest.get('settings') != settings:
-                raise FactoryError('Factory settings differ from retained state; no implicit resize/rebuild/expansion. Use add-workers for expansion.')
-        else:
-            self.manifest = {'schema': 1, 'settings': settings, 'owner_id': uuid.uuid4().hex, 'nodes': {}}
-            self.save()
-        vms = self.inventory_vms()
-        for name, _ in self.desired:
-            matches = [vm for vm in vms if vm.get('name') == name]
-            recorded = self.manifest['nodes'].get(name)
-            if matches and (not recorded or len(matches) != 1 or int(matches[0]['vmid']) != recorded['vmid']):
-                raise FactoryError(f'VM name {name} already exists outside this manifest; refusing adoption.')
+        self.progress('Checking fresh factory request and Proxmox template')
+        desired_names = {name for name, _ in self.desired}
+        conflicts = sorted(vm['name'] for vm in self.inventory_vms() if vm.get('name') in desired_names)
+        if conflicts:
+            raise FactoryError('Fresh factory requires unused VM names. Existing: ' + ', '.join(conflicts)
+                               + '. Remove the previous VMs yourself before running again; no VM deleted or adopted.')
         template = self.api.call('GET', f"{self.base}/{self.cfg['template_id']}/config")
         if not template.get('template') or template.get('cicustom') or not template.get('net0') or not any('cloudinit' in str(v) for k, v in template.items() if re.fullmatch(r'(ide|scsi|sata)\d+', k)):
             raise FactoryError('Source must be a Cloud-Init template with net0, scsi0, and no cicustom override.')
         if self.cfg['disk_gb'] < disk_size_gib(template):
             raise FactoryError('Requested disk is smaller than the template.')
+        # Prior records never constrain a fresh request. Keep them as audit history.
+        old_artifacts = [self.state_dir / name for name in ('manifest.json', 'inventory.json', 'known_hosts')]
+        if any(path.exists() for path in old_artifacts):
+            history = self.state_dir / 'history' / uuid.uuid4().hex
+            history.mkdir(parents=True, mode=0o700)
+            for path in old_artifacts:
+                if path.exists():
+                    os.replace(path, history / path.name)
+            self.progress('Archived previous factory records at ' + str(history))
+        self.manifest = {'schema': 1, 'mode': 'fresh', 'settings': dict(self.cfg),
+                         'owner_id': uuid.uuid4().hex, 'nodes': {}}
+        self.save()
         for name, group in self.desired:
-            if name not in self.manifest['nodes']:
-                vmid = int(self.api.call('GET', '/cluster/nextid'))
-                if vmid == self.cfg['template_id'] or any(vm['vmid'] == vmid for vm in self.manifest['nodes'].values()):
-                    raise FactoryError('Allocated VMID conflicts with retained state; inspect Proxmox.')
-                self.manifest['nodes'][name] = {'name': name, 'group': group, 'vmid': vmid,
-                    'owner': f"homelab-factory:{self.manifest['owner_id']}:{name}", 'phase': 'planned'}
-                self.save()
+            vmid = int(self.api.call('GET', '/cluster/nextid'))
+            if vmid == self.cfg['template_id'] or any(vm['vmid'] == vmid for vm in self.manifest['nodes'].values()):
+                raise FactoryError('Allocated VMID conflicts with this run; inspect Proxmox.')
+            self.manifest['nodes'][name] = {'name': name, 'group': group, 'vmid': vmid,
+                'owner': f"homelab-factory:{self.manifest['owner_id']}:{name}", 'phase': 'planned'}
+            self.save()
             self.provision(self.manifest['nodes'][name])
         nodes = [self.manifest['nodes'][name] for name, _ in self.desired]
         if len({node['ip'] for node in nodes}) != len(nodes):

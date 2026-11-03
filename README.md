@@ -54,6 +54,8 @@ Worker interfaces are detected automatically from their route to the master. Dif
 | Init Istio + VMs | [cluster-istio.yml](ansible/playbooks/cluster-istio.yml) | [runner-local.yml](ansible/inventory/runner-local.yml) | `cluster_name`, `worker_count`, LAN/LB settings, optional `gateway_hostname` |
 | Add workers | [add-workers.yml](ansible/playbooks/add-workers.yml) | Target master and new workers | `master`, `workers` |
 
+Each factory run creates a fresh fleet. Remove the previous VMs yourself before running the factory again with the same names. Old manifests are archived for audit and do not restrict the new form values. Existing VM names stop provisioning before clone; the factory never deletes VMs.
+
 Pass run parameters as **Extra variables**. Proxmox credentials use **Environment variables**. Guest access uses generated SSH keys; the integrated factory does not require a guest password. `master` is an inventory hostname. Init and worker expansion have separate forms; no `cluster_operation` is needed.
 
 <details>

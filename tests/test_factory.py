@@ -23,6 +23,7 @@ class FakeProxmox:
         self.next_pid = 1
         self.fail_cloud_init = False
         self.fail_clone_wait = False
+        self.ip_prefix = '192.168.1'
         self.template = {'template': 1, 'scsi0': 'nvme:base-9201,size=20G',
                          'ide2': 'nvme:cloudinit,media=cdrom', 'net0': 'virtio,bridge=vmbr1'}
 
@@ -47,7 +48,7 @@ class FakeProxmox:
             assert newid not in self.vms
             self.vms[newid] = dict(self.template, name=params['name'], description=params['description'],
                                     status='stopped', boot_id='11111111-1111-1111-1111-111111111111',
-                                    ip=f'192.168.1.{newid}')
+                                    ip=f'{self.ip_prefix}.{newid}')
             return 'UPID:pve:clone'
         vm = self.vms[vmid]
         if action == 'config':
@@ -139,25 +140,61 @@ class FactoryTests(unittest.TestCase):
         status = json.loads((Path(result['inventory_path']).parent / 'progress.json').read_text())
         self.assertIn('All 5 VMs ready', status['message'])
 
-    def test_retry_refreshes_dhcp_without_reclone_reconfigure_or_reboot(self):
+    def test_fresh_run_after_manual_cleanup_ignores_old_settings(self):
         first = self.run_factory()
-        retained_keys = [Path(node['key_path']).read_bytes() for node in first['nodes']]
-        self.api.events.clear()
-        self.api.vms[101]['ip'] = '192.168.1.150'
-        second = self.run_factory()
-        self.assertFalse(second['changed'])
-        self.assertEqual(second['nodes'][0]['ip'], '192.168.1.150')
-        self.assertFalse(any(method != 'GET' and '/agent/exec' not in path for method, path, _ in self.api.events))
-        self.assertEqual(retained_keys, [Path(node['key_path']).read_bytes() for node in second['nodes']])
+        manifest_path = Path(first['inventory_path']).parent / 'manifest.json'
+        previous = json.loads(manifest_path.read_text())
+        previous_keys = {node['key_path']: Path(node['key_path']).read_bytes() for node in first['nodes']}
+        self.api.vms.clear()  # Operator removes the previous VMs outside the factory.
+        self.cfg.update(worker_count=9, memory_mb=4096, node_lan_cidr='192.168.10.0/24',
+                        lb_start_ip='192.168.10.10', lb_stop_ip='192.168.10.20')
+        self.api.ip_prefix = '192.168.10'
+        result = self.run_factory()
+        current = json.loads(manifest_path.read_text())
+        self.assertTrue(result['changed'])
+        self.assertEqual(len(result['nodes']), 10)
+        self.assertNotEqual(current['owner_id'], previous['owner_id'])
+        self.assertEqual(current['mode'], 'fresh')
+        self.assertEqual(current['settings']['worker_count'], 9)
+        self.assertTrue(all(node['ip'].startswith('192.168.10.') for node in result['nodes']))
+        self.assertTrue(all(node['key_path'] not in previous_keys for node in result['nodes']))
+        for key_path, content in previous_keys.items():
+            self.assertEqual(Path(key_path).read_bytes(), content)
+        archives = list(manifest_path.parent.glob('history/*/manifest.json'))
+        self.assertEqual(len(archives), 1)
+        self.assertEqual(json.loads(archives[0].read_text()), previous)
 
-    def test_resume_interrupted_clone_wait(self):
+    def test_existing_fleet_is_never_resumed_reconfigured_or_deleted(self):
+        first = self.run_factory()
+        manifest_path = Path(first['inventory_path']).parent / 'manifest.json'
+        previous = manifest_path.read_bytes()
+        self.cfg['worker_count'] = 9
+        self.api.events.clear()
+        with self.assertRaisesRegex(factory.FactoryError, 'Fresh factory requires unused VM names'):
+            self.run_factory()
+        self.assertTrue(all(method == 'GET' for method, _, _ in self.api.events))
+        self.assertEqual(manifest_path.read_bytes(), previous)
+        self.assertEqual(len(self.api.vms), 5)
+
+    def test_stale_or_invalid_manifest_does_not_block_fresh_creation(self):
+        runner = factory.Factory(self.cfg, self.api)
+        runner.manifest_path.write_text('old invalid state that is never read')
+        result = runner.run()
+        self.assertEqual(len(result['nodes']), 5)
+        archived = list(runner.state_dir.glob('history/*/manifest.json'))
+        self.assertEqual(archived[0].read_text(), 'old invalid state that is never read')
+
+    def test_interrupted_clone_requires_manual_cleanup_before_fresh_run(self):
         self.api.fail_clone_wait = True
         with self.assertRaisesRegex(factory.FactoryError, 'clone timeout'):
             self.run_factory()
+        with self.assertRaisesRegex(factory.FactoryError, 'Fresh factory requires unused VM names'):
+            self.run_factory()
+        self.assertEqual(len(self.api.vms), 1)
+        self.api.vms.clear()
         result = self.run_factory()
         self.assertEqual(len(result['nodes']), 5)
-        clones = [event for event in self.api.events if event[1].endswith('/clone')]
-        self.assertEqual(len(clones), 5)
+        self.assertEqual(sum(path.endswith('/clone') for _, path, _ in self.api.events), 6)
 
     def test_cloud_init_failure_stops_before_reboot_or_network(self):
         self.api.fail_cloud_init = True
@@ -165,42 +202,39 @@ class FactoryTests(unittest.TestCase):
             self.run_factory()
         self.assertFalse(any(path.endswith(('/status/reboot', '/agent/network-get-interfaces')) for _, path, _ in self.api.events))
         self.api.fail_cloud_init = False
+        self.api.vms.clear()
         self.assertEqual(len(self.run_factory()['nodes']), 5)
 
     def test_foreign_name_is_rejected_before_clone(self):
         self.api.vms[500] = {'name': 'dev-cilium-master-1'}
-        with self.assertRaisesRegex(factory.FactoryError, 'refusing adoption'):
+        with self.assertRaisesRegex(factory.FactoryError, 'Fresh factory requires unused VM names'):
             self.run_factory()
         self.assertFalse(any(path.endswith('/clone') for _, path, _ in self.api.events))
 
-    def test_ownership_mismatch_and_missing_key_never_modify_existing_vm(self):
-        result = self.run_factory()
-        original = self.api.vms[101]['description']
-        self.api.vms[101]['description'] = 'foreign'
-        self.api.events.clear()
+    def test_clone_ownership_mismatch_stops_before_configuration(self):
+        original_call = self.api.call
+
+        def tampered_clone(method, path, **params):
+            result = original_call(method, path, **params)
+            if path.endswith('/clone'):
+                self.api.vms[params['newid']]['description'] = 'foreign'
+            return result
+
+        self.api.call = tampered_clone
         with self.assertRaisesRegex(factory.FactoryError, 'Ownership mismatch'):
             self.run_factory()
-        self.assertTrue(all(method == 'GET' for method, _, _ in self.api.events))
-        self.api.vms[101]['description'] = original
-        Path(result['nodes'][0]['key_path']).unlink()
-        with self.assertRaisesRegex(factory.FactoryError, 'Missing retained SSH key'):
-            self.run_factory()
-
-    def test_refuses_changed_manifest_settings(self):
-        self.run_factory()
-        self.cfg['worker_count'] = 9
-        with self.assertRaisesRegex(factory.FactoryError, 'settings differ'):
-            self.run_factory()
-
-    def test_lost_vm_is_not_replaced(self):
-        self.run_factory()
-        del self.api.vms[101]
-        with self.assertRaisesRegex(factory.FactoryError, 'no automatic replacement'):
-            self.run_factory()
+        self.assertFalse(any(method == 'POST' and path.endswith('/config') for method, path, _ in self.api.events))
 
     def test_duplicate_final_addresses_are_rejected(self):
-        self.run_factory()
-        self.api.vms[102]['ip'] = self.api.vms[101]['ip']
+        original_call = self.api.call
+
+        def duplicate_address(method, path, **params):
+            result = original_call(method, path, **params)
+            if path.endswith('/agent/network-get-interfaces'):
+                result['result'][0]['ip-addresses'][0]['ip-address'] = '192.168.1.150'
+            return result
+
+        self.api.call = duplicate_address
         with self.assertRaisesRegex(factory.FactoryError, 'Duplicate DHCP'):
             self.run_factory()
 

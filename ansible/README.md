@@ -52,17 +52,19 @@ Bridge dan DHCP sudah harus tersedia. Template wajib punya QEMU Guest Agent yang
 
 Default VM: node `pve`, template `9201`, storage `nvme`, bridge `vmbr1`, user `debian`, 4 core, RAM 8192 MiB, disk 30 GiB. Override lewat Extra vars; lihat `roles/homelab_factory/defaults/main.yml`. Factory menggunakan Python standard library dan `ssh-keygen`, tanpa dependensi collection tambahan.
 
-## State persisten dan retry
+## Fresh provisioning dan catatan persisten
 
 Mount `VM_SSH_KEY_DIR` (default `/var/lib/homelab/vm-keys`), mode `0700`, berisi marker `.persistent-key-store`. Semua runner yang menjalankan cluster yang sama harus memakai volume yang sama. Matikan Allow parallel tasks di template Semaphore.
 
-Key per VM tersimpan sebagai `vm-<VMID>`. Manifest, lock, known_hosts, dan inventory aktual tersimpan di `clusters/<cluster_name>--<stack>/`. Jangan gunakan direktori checkout atau `/tmp` untuk state ini. Path inventory hasil provisioning ditampilkan saat run.
+Key per VM tersimpan sebagai `vm-<VMID>-<run-id>`, sehingga Run baru mendapat key baru walaupun VMID dipakai kembali. Manifest, lock, known_hosts, dan inventory aktual tersimpan di `clusters/<cluster_name>--<stack>/`. Jangan gunakan direktori checkout atau `/tmp` untuk state ini. Path inventory hasil provisioning ditampilkan saat run.
 
-Retry menggunakan VMID/key tersimpan dan memverifikasi marker kepemilikan pada deskripsi VM. VM yang sudah selesai tidak di-clone, dikonfigurasi ulang, atau di-reboot ulang; IP DHCP tetap dibaca ulang. Clone task yang tercatat ditunggu kembali. Jika respons submit clone terputus sebelum task ID tersimpan, atau VM/key hilang, flow berhenti untuk inspeksi. Tidak ada delete/reset/adopsi otomatis. Perubahan konfigurasi VM/jumlah worker pada manifest yang sama ditolak; ekspansi menggunakan flow worker. Partial kubeadm init tetap memerlukan inspeksi sesuai validasi cluster.
+Setiap Run factory membuat fleet baru dari awal. Manifest lama tidak dibaca untuk resume atau dibandingkan dengan form baru. Setelah VM sebelumnya dihapus oleh operator, subnet, pool LB, resource, atau jumlah worker dapat diubah lalu Run kembali. Catatan/inventory lama diarsipkan ke `history/<id>/`; key lama tetap disimpan.
+
+Sebelum clone, factory memeriksa seluruh nama VM yang akan dibuat. Jika salah satu masih ada, Run berhenti dengan daftar nama yang bentrok. Operator membersihkan VM hasil Run sebelumnya terlebih dahulu, termasuk jika provisioning sebelumnya gagal sebagian. Factory tidak menghapus, me-reset, mengadopsi, atau melanjutkan VM existing. Manifest baru hanya mencatat hasil dan tahap Run saat ini. Proses pembuatan VM, Cloud-Init, restart, pembacaan IP, dan init Kubernetes tetap satu alur.
 
 Log `[factory]` menampilkan nama VM, VMID, tahap lifecycle, dan heartbeat setiap 30 detik saat menunggu. Status terakhir juga disimpan sebagai `progress.json` di direktori cluster. `factory_timeout` default 900 detik berlaku per tahap tunggu, bukan total seluruh VM; clone dan provisioning dilakukan berurutan. Timeout menampilkan tahap yang macet dan error API terakhir. Perubahan kode hanya berlaku untuk Run berikutnya, bukan proses yang sudah berjalan.
 
-IP node harus tetap stabil setelah Kubernetes di-init. Gunakan reservasi DHCP berdasarkan MAC VM yang dibuat factory sebelum pemakaian jangka panjang. Jika IP berubah sesudah cluster aktif, perbaiki lease/reservasi; pembacaan ulang IP bukan migrasi endpoint Kubernetes otomatis.
+IP node harus tetap stabil setelah Kubernetes di-init. Gunakan reservasi DHCP berdasarkan MAC VM yang dibuat factory sebelum pemakaian jangka panjang. Jika IP berubah sesudah cluster aktif, perbaiki lease/reservasi; factory bukan alat migrasi endpoint Kubernetes.
 
 ## Memakai VM yang sudah ada
 
