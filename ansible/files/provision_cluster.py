@@ -37,6 +37,13 @@ class GuestProcessLost(FactoryError):
     pass
 
 
+class GuestCommandError(FactoryError):
+    def __init__(self, record, command, result):
+        self.result = result
+        super().__init__(f"Guest command {command[0]} failed on {record['name']} "
+                         f"(exit code {result.get('exitcode', 'unknown')}); inspect guest logs.")
+
+
 def fresh_nic(template_net0, bridge, mac):
     # Keep the template's VLAN/trunk and NIC tuning, but replace its identity.
     properties = dict(part.split('=', 1) for part in template_net0.split(',') if '=' in part)
@@ -243,7 +250,7 @@ class Factory:
         result = self.poll('guest command ' + ' '.join(command[:3]) + ' on ' + record['name'],
                            execute)
         if result.get('exitcode') != 0 or result.get('out-truncated'):
-            raise FactoryError(f"Guest command {command[0]} failed on {record['name']}; inspect Cloud-Init/guest logs.")
+            raise GuestCommandError(record, command, result)
         return result.get('out-data', '')
 
     def _exec_status(self, path, pid):
@@ -257,16 +264,30 @@ class Factory:
 
     def wait_cloud_init(self, record):
         def completed():
-            output = self.guest_exec(record, ['/usr/bin/cloud-init', 'status', '--format=json'], retry_lost=True)
+            exitcode = 0
             try:
-                status = json.loads(output)['status']
+                output = self.guest_exec(record, ['/usr/bin/cloud-init', 'status', '--format=json'], retry_lost=True)
+            except GuestCommandError as error:
+                if error.result.get('out-truncated') or error.result.get('exitcode') not in (1, 2):
+                    raise
+                output = error.result.get('out-data', '')
+                exitcode = error.result.get('exitcode', 'unknown')
+            try:
+                details = json.loads(output)
+                status = details['status']
             except (ValueError, KeyError, TypeError):
-                raise FactoryError('Cloud-Init returned invalid status JSON on ' + record['name']) from None
-            if status == 'done':
+                raise FactoryError(f"Cloud-Init returned invalid status JSON on {record['name']} (exit code {exitcode}).") from None
+            if status == 'done' and exitcode == 0:
                 return True
-            if status == 'running':
+            if status == 'running' and exitcode == 0:
                 return None
-            raise FactoryError(f'Cloud-Init status is {status} on {record["name"]}; inspect its guest logs.')
+            # Report module names, not raw user-data errors that could contain secrets.
+            modules = sorted(set(re.findall(
+                r'package-update-upgrade-install|apt-configure|scripts-user|runcmd|set-passwords|users-groups',
+                json.dumps(details))))
+            module_hint = ' Failed modules: ' + ', '.join(modules) + '.' if modules else ''
+            raise FactoryError(f'Cloud-Init status is {status} on {record["name"]} (exit code {exitcode}).'
+                               + module_hint + ' Inspect /var/log/cloud-init-output.log in this VM.')
         self.poll('Cloud-Init completion on ' + record['name'], completed)
 
     def clean_network_identity(self, record):
@@ -352,7 +373,7 @@ Path('/var/lib/NetworkManager/secret_key').unlink(missing_ok=True)
                           memory=self.cfg['memory_mb'], balloon=0, onboot=1, agent='enabled=1',
                           net0=fresh_nic(config['net0'], self.cfg['bridge'], record['mac']),
                           smbios1='uuid=' + record['firmware_uuid'],
-                          ciuser=self.cfg['cloud_init_user'],
+                          ciuser=self.cfg['cloud_init_user'], ciupgrade=0,
                           sshkeys=quote(public_key, safe=''), ipconfig0='ip=dhcp',
                           tags=f"iac;homelab-{self.cfg['stack']}")
             if task:

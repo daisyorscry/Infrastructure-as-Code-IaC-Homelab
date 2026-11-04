@@ -52,6 +52,8 @@ Bridge dan DHCP sudah harus tersedia. Template wajib punya QEMU Guest Agent yang
 
 Default VM: node `pve`, template `9201`, storage `nvme`, bridge `vmbr1`, user `debian`, 4 core, RAM 8192 MiB, disk 30 GiB. Override lewat Extra vars; lihat `roles/homelab_factory/defaults/main.yml`. Factory menggunakan Python standard library dan `ssh-keygen`, tanpa dependensi collection tambahan.
 
+Factory memasang `ciupgrade=0` sebelum boot agar Proxmox tidak mengaktifkan `dist-upgrade` otomatis dalam user-data Cloud-Init. Paket Kubernetes/CRI-O dipasang oleh Ansible sesuai versi pin; upgrade OS dikelola terpisah. Gunakan template OS bersih tanpa paket/repo Kubernetes lama atau script upgrade custom. Jika template sendiri mengaktifkan upgrade melalui config Cloud-Init, rapikan template tersebut juga. Akses HTTPS guest ke mirror Debian dan repository Kubernetes/CRI-O tetap diperlukan saat bootstrap. Error Cloud-Init menampilkan status, exit code, dan nama modul yang gagal; status error/degraded tetap menghentikan provisioning.
+
 Trunk/VLAN bukan mekanisme meminta IP baru. Jika template memiliki `tag`/`trunks`, factory mempertahankannya; tanpa itu NIC tetap untagged. Bridge/uplink Proxmox harus mendukung VLAN yang digunakan template. Identitas MAC dan machine-id baru membantu DHCP mengenali clone sebagai klien berbeda; server DHCP tetap menentukan alamat dan dapat memakai kembali IP yang sudah bebas. Template sebaiknya sudah dibersihkan dari identitas/lease sebelum dijadikan golden image untuk menghindari bentrok pada boot awal, sebelum factory mendapat akses Guest Agent.
 
 ## Fresh provisioning dan catatan persisten

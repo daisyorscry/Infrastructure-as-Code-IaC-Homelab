@@ -27,7 +27,7 @@ class FakeProxmox:
         self.lose_cleanup_pid_once = False
         self.cloud_init_running_once = False
         self.ip_prefix = '192.168.1'
-        self.template = {'template': 1, 'scsi0': 'nvme:base-9201,size=20G',
+        self.template = {'template': 1, 'ciupgrade': 1, 'scsi0': 'nvme:base-9201,size=20G',
                          'ide2': 'nvme:cloudinit,media=cdrom', 'net0': 'virtio,bridge=vmbr1'}
 
     def call(self, method, path, **params):
@@ -65,6 +65,7 @@ class FakeProxmox:
         if action == 'status/current':
             return {'status': vm['status']}
         if action == 'status/start':
+            vm['auto_upgrade_at_boot'] = bool(vm.get('ciupgrade', 1))
             vm['status'] = 'running'
             return 'UPID:pve:start'
         if action == 'status/reboot':
@@ -82,7 +83,10 @@ class FakeProxmox:
                 else:
                     state = 'running' if self.cloud_init_running_once else 'done'
                     self.cloud_init_running_once = False
-                    output, rc = json.dumps({'status': state}), 1 if self.fail_cloud_init else 0
+                    details = {'status': 'error' if self.fail_cloud_init else state}
+                    if self.fail_cloud_init:
+                        details['errors'] = [['package-update-upgrade-install', 'apt-get dist-upgrade failed; secret=do-not-log']]
+                    output, rc = json.dumps(details), 1 if self.fail_cloud_init else 0
             elif command[0] == '/usr/bin/python3':
                 vm['leases_cleaned'] = True
                 output, rc = '', 0
@@ -154,6 +158,8 @@ class FactoryTests(unittest.TestCase):
         self.assertIn('192.168.1.101 ssh-ed25519 ', Path(result['known_hosts_path']).read_text())
         for vm in self.api.vms.values():
             self.assertEqual(vm['ipconfig0'], 'ip=dhcp')
+            self.assertFalse(vm['auto_upgrade_at_boot'])
+            self.assertEqual(vm['ciupgrade'], 0)
             self.assertTrue(vm['identity_cleaned'])
             self.assertTrue(vm['leases_cleaned'])
         nics = [vm['net0'].split(',')[0] for vm in self.api.vms.values()]
@@ -226,12 +232,27 @@ class FactoryTests(unittest.TestCase):
 
     def test_cloud_init_failure_stops_before_reboot_or_network(self):
         self.api.fail_cloud_init = True
-        with self.assertRaisesRegex(factory.FactoryError, 'Guest command'):
+        with self.assertRaisesRegex(factory.FactoryError, 'Cloud-Init status is error.*exit code 1.*package-update-upgrade-install') as error:
             self.run_factory()
+        self.assertNotIn('do-not-log', str(error.exception))
         self.assertFalse(any(path.endswith(('/status/reboot', '/agent/network-get-interfaces')) for _, path, _ in self.api.events))
         self.api.fail_cloud_init = False
         self.api.vms.clear()
         self.assertEqual(len(self.run_factory()['nodes']), 5)
+
+    def test_cloud_init_done_with_nonzero_exit_is_not_accepted_as_success(self):
+        original_call = self.api.call
+
+        def degraded_cloud_init(method, path, **params):
+            result = original_call(method, path, **params)
+            if path.endswith('/agent/exec') and params['command'][:2] == ['/usr/bin/cloud-init', 'status']:
+                self.api.commands[result['pid']]['exitcode'] = 2
+            return result
+
+        self.api.call = degraded_cloud_init
+        with self.assertRaisesRegex(factory.FactoryError, 'Cloud-Init status is done.*exit code 2'):
+            self.run_factory()
+        self.assertFalse(any(path.endswith('/status/reboot') for _, path, _ in self.api.events))
 
     def test_foreign_name_is_rejected_before_clone(self):
         self.api.vms[500] = {'name': 'dev-cilium-master-1'}
